@@ -79,8 +79,8 @@ def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
     datestamp = datestamp or FORCE_DATESTAMP
 
     # Make base path
-    ymd_time = time.strftime("%Y-%m-%d_") if datestamp else ''
-    relpath = ''.join([ymd_time, exp_name])
+    ymd_time = time.strftime("%Y%m%d_%H%M%S") if datestamp else ''
+    relpath = f"{exp_name}_{ymd_time}"
     
     if seed is not None:
         # Make a seed-specific subfolder in the experiment directory.

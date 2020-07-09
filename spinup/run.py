@@ -48,6 +48,7 @@ def friendly_err(err_msg):
 def parse_and_execute_grid_search(cmd, args):
     """Interprets algorithm name and cmd line args into an ExperimentGrid."""
 
+    algo_name = cmd
     if cmd in BASE_ALGO_NAMES:
         backend = DEFAULT_BACKEND[cmd]
         print('\n\nUsing default backend (%s) for %s.\n'%(backend, cmd))
@@ -83,6 +84,10 @@ def parse_and_execute_grid_search(cmd, args):
             arg_dict[arg_key] = []
         else:
             arg_dict[arg_key].append(process(arg))
+
+    if 'exp_name' not in arg_dict:
+        arg_dict['exp_name'] = ['debug']
+    arg_dict['exp_name'][0] = f"{algo_name}_{arg_dict['exp_name'][0]}"
 
     # Make second pass through, to catch flags that have no vals.
     # Assume such flags indicate that a boolean parameter should have

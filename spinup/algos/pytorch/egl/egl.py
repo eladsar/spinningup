@@ -9,6 +9,7 @@ import spinup.algos.pytorch.egl.core as core
 from spinup.utils.logx import EpochLogger
 import math
 import torch.nn.functional as F
+from tqdm import tqdm
 
 
 class ReplayBuffer:
@@ -357,7 +358,7 @@ def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     o, ep_ret, ep_len = env.reset(), 0, 0
 
     # Main loop: collect experience in env and update/log each epoch
-    for t in range(total_steps):
+    for t in tqdm(range(total_steps)):
         
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards, 
@@ -428,7 +429,7 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--eps', type=float, default=0.1)
+    parser.add_argument('--eps', type=float, default=0.2)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--n_explore', type=int, default=4)
@@ -437,11 +438,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
+    exp_name = f"{args.env.split('-')[0]}_{args.exp_name}"
+    logger_kwargs = setup_logger_kwargs(exp_name, args.seed)
 
     torch.set_num_threads(torch.get_num_threads())
 
     egl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore, device=device)
+        logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,
+        device=args.device, batch_size=args.batch_size)

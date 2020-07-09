@@ -292,7 +292,8 @@ if __name__ == '__main__':
     mpi_fork(args.cpu)  # run parallel code with mpi
 
     from spinup.utils.run_utils import setup_logger_kwargs
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
+    exp_name = f"{args.env.split('-')[0]}_{args.exp_name}"
+    logger_kwargs = setup_logger_kwargs(exp_name, args.seed)
 
     vpg(lambda : gym.make(args.env), actor_critic=core.mlp_actor_critic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 

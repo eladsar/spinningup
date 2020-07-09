@@ -5,16 +5,20 @@ import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
-import spinup.algos.pytorch.td3.core as core
+import spinup.algos.pytorch.egl.core as core
 from spinup.utils.logx import EpochLogger
+import math
+import torch.nn.functional as F
 
 
 class ReplayBuffer:
     """
-    A simple FIFO experience replay buffer for TD3 agents.
+    A simple FIFO experience replay buffer for SAC agents.
     """
 
-    def __init__(self, obs_dim, act_dim, size):
+    def __init__(self, obs_dim, act_dim, size, device):
+
+        self.device = device
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
@@ -38,18 +42,37 @@ class ReplayBuffer:
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
                      done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k,v in batch.items()}
 
 
+def repeat_and_reshape(x, n):
 
-def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+    x_expand = x.repeat(n, *[1] * len(x.shape))
+    x_expand = x_expand.view(n * len(x), -1)
+
+    return x_expand
+
+
+def ball_explore(a1, n_explore, eps):
+
+    b, act_dim = a1.shape
+    a1 = a1.unsqueeze(0)
+    x = torch.zeros_like(a1).normal_()
+    mag = torch.zeros(n_explore, b, 1, device=a1.device).uniform_()
+
+    x = x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
+    a2 = a1 + eps * math.sqrt(act_dim) * mag * x
+
+    return a2
+
+
+def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
-        update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
-        noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1):
+        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
+        update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
+        logger_kwargs=dict(), save_freq=1, eps=0.1, n_explore=32, device='cuda'):
     """
-    Twin Delayed Deep Deterministic Policy Gradient (TD3)
+    Soft Actor-Critic (SAC)
 
 
     Args:
@@ -61,15 +84,13 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             The ``act`` method and ``pi`` module should accept batches of 
             observations as inputs, and ``q1`` and ``q2`` should accept a batch 
             of observations and a batch of actions as inputs. When called, 
-            these should return:
+            ``act``, ``q1``, and ``q2`` should return:
 
             ===========  ================  ======================================
             Call         Output Shape      Description
             ===========  ================  ======================================
             ``act``      (batch, act_dim)  | Numpy array of actions for each 
                                            | observation.
-            ``pi``       (batch, act_dim)  | Tensor containing actions from policy
-                                           | given observations.
             ``q1``       (batch,)          | Tensor containing one current estimate
                                            | of Q* for the provided observations
                                            | and actions. (Critical: make sure to
@@ -80,8 +101,20 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                                            | flatten this!)
             ===========  ================  ======================================
 
+            Calling ``pi`` should return:
+
+            ===========  ================  ======================================
+            Symbol       Shape             Description
+            ===========  ================  ======================================
+            ``a``        (batch, act_dim)  | Tensor containing actions from policy
+                                           | given observations.
+            ``logp_pi``  (batch,)          | Tensor containing log probabilities of
+                                           | actions in ``a``. Importantly: gradients
+                                           | should be able to flow back into ``a``.
+            ===========  ================  ======================================
+
         ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to TD3.
+            you provided to SAC.
 
         seed (int): Seed for random number generators.
 
@@ -104,9 +137,10 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
             close to 1.)
 
-        pi_lr (float): Learning rate for policy.
+        lr (float): Learning rate (used for both policy and value learning).
 
-        q_lr (float): Learning rate for Q-networks.
+        alpha (float): Entropy regularization coefficient. (Equivalent to 
+            inverse of reward scale in the original SAC paper.)
 
         batch_size (int): Minibatch size for SGD.
 
@@ -122,18 +156,6 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             you wait between updates, the ratio of env steps to gradient steps 
             is locked to 1.
 
-        act_noise (float): Stddev for Gaussian exploration noise added to 
-            policy at training time. (At test time, no noise is added.)
-
-        target_noise (float): Stddev for smoothing noise added to target 
-            policy.
-
-        noise_clip (float): Limit for absolute value of target policy 
-            smoothing noise.
-
-        policy_delay (int): Policy will only be updated once every 
-            policy_delay times for each update of the Q-networks.
-
         num_test_episodes (int): Number of episodes to test the deterministic
             policy at the end of each epoch.
 
@@ -145,7 +167,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             the current policy and value function.
 
     """
-
+    device = torch.device(device)
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
@@ -160,7 +182,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     act_limit = env.action_space.high[0]
 
     # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs).to(device)
     ac_targ = deepcopy(ac)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
@@ -171,13 +193,13 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
 
     # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2, ac.geps])
+    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d, \t geps: %d\n'%var_counts)
 
-    # Set up function for computing TD3 Q-losses
+    # Set up function for computing SAC Q-losses
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
@@ -186,19 +208,14 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         # Bellman backup for Q functions
         with torch.no_grad():
-            pi_targ = ac_targ.pi(o2)
-
-            # Target policy smoothing
-            epsilon = torch.randn_like(pi_targ) * target_noise
-            epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
-            a2 = pi_targ + epsilon
-            a2 = torch.clamp(a2, -act_limit, act_limit)
+            # Target actions come from *current* policy
+            a2, logp_a2 = ac.pi(o2)
 
             # Target Q-values
             q1_pi_targ = ac_targ.q1(o2, a2)
             q2_pi_targ = ac_targ.q2(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-            backup = r + gamma * (1 - d) * q_pi_targ
+            backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
 
         # MSE loss against Bellman backup
         loss_q1 = ((q1 - backup)**2).mean()
@@ -206,74 +223,130 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach().numpy(),
-                         Q2Vals=q2.detach().numpy())
+        q_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                      Q2Vals=q2.detach().cpu().numpy())
 
-        return loss_q, loss_info
+        return loss_q, q_info
 
-    # Set up function for computing TD3 pi loss
+    # Set up function for computing EGL mean-gradient-losses
+    def compute_loss_g(data):
+
+        o, a1, r, o_tag, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        a2 = ball_explore(a1, n_explore, eps)
+
+        a2 = a2.view(n_explore * len(r), act_dim)
+        o_expand = repeat_and_reshape(o, n_explore)
+
+        # Bellman backup for Q functions
+        with torch.no_grad():
+
+            q1 = ac.q1(o_expand, a2)
+            q2 = ac.q2(o_expand, a2)
+            q_dither = torch.min(q1, q2)
+
+            # Target actions come from *current* policy
+            a_tag, logp_a_tag = ac.pi(o_tag)
+
+            # Target Q-values
+            q1_pi_targ = ac_targ.q1(o_tag, a_tag)
+            q2_pi_targ = ac_targ.q2(o_tag, a_tag)
+            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            q_anchor = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a_tag)
+
+            q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
+
+        geps = ac.geps(o, a1)
+        geps = repeat_and_reshape(geps, n_explore)
+        a1 = repeat_and_reshape(a1, n_explore)
+
+        geps = (geps * (a2 - a1)).sum(-1)
+        # l1 loss against Bellman backup
+
+        loss_g = F.smooth_l1_loss(geps, q_dither - q_anchor)
+
+        # Useful info for logging
+        g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
+
+        return loss_g, g_info
+
+    # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
-        q1_pi = ac.q1(o, ac.pi(o))
-        return -q1_pi.mean()
+        pi, logp_pi = ac.pi(o)
+        geps_pi = ac.geps(o, pi)
+
+        # Entropy-regularized policy loss
+        loss_pi = (alpha * logp_pi - (geps_pi * pi).sum(-1)).mean()
+
+        # Useful info for logging
+        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
+
+        return loss_pi, pi_info
 
     # Set up optimizers for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    q_optimizer = Adam(q_params, lr=q_lr)
+    pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
+    q_optimizer = Adam(q_params, lr=lr)
+    g_optimizer = Adam(ac.geps.parameters(), lr=lr)
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
-    def update(data, timer):
+    def update(data):
+
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
-        loss_q, loss_info = compute_loss_q(data)
+        loss_q, q_info = compute_loss_q(data)
         loss_q.backward()
         q_optimizer.step()
 
         # Record things
-        logger.store(LossQ=loss_q.item(), **loss_info)
+        logger.store(LossQ=loss_q.item(), **q_info)
 
-        # Possibly update pi and target networks
-        if timer % policy_delay == 0:
+        # Next run one gradient descent step for the mean-gradient
+        g_optimizer.zero_grad()
+        loss_g, g_info = compute_loss_g(data)
+        loss_g.backward()
+        g_optimizer.step()
 
-            # Freeze Q-networks so you don't waste computational effort 
-            # computing gradients for them during the policy learning step.
-            for p in q_params:
-                p.requires_grad = False
+        # Record things
+        logger.store(LossG=loss_g.item(), **g_info)
 
-            # Next run one gradient descent step for pi.
-            pi_optimizer.zero_grad()
-            loss_pi = compute_loss_pi(data)
-            loss_pi.backward()
-            pi_optimizer.step()
+        # Freeze Q-networks so you don't waste computational effort 
+        # computing gradients for them during the policy learning step.
+        for p in ac.geps.parameters():
+            p.requires_grad = False
 
-            # Unfreeze Q-networks so you can optimize it at next DDPG step.
-            for p in q_params:
-                p.requires_grad = True
+        # Next run one gradient descent step for pi.
+        pi_optimizer.zero_grad()
+        loss_pi, pi_info = compute_loss_pi(data)
+        loss_pi.backward()
+        pi_optimizer.step()
 
-            # Record things
-            logger.store(LossPi=loss_pi.item())
+        # Unfreeze Q-networks so you can optimize it at next DDPG step.
+        for p in ac.geps.parameters():
+            p.requires_grad = True
 
-            # Finally, update target networks by polyak averaging.
-            with torch.no_grad():
-                for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
-                    p_targ.data.mul_(polyak)
-                    p_targ.data.add_((1 - polyak) * p.data)
+        # Record things
+        logger.store(LossPi=loss_pi.item(), **pi_info)
 
-    def get_action(o, noise_scale):
-        a = ac.act(torch.as_tensor(o, dtype=torch.float32))
-        a += noise_scale * np.random.randn(act_dim)
-        return np.clip(a, -act_limit, act_limit)
+        # Finally, update target networks by polyak averaging.
+        with torch.no_grad():
+            for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                p_targ.data.mul_(polyak)
+                p_targ.data.add_((1 - polyak) * p.data)
+
+    def get_action(o, deterministic=False):
+        return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device), deterministic)
 
     def test_agent():
         for j in range(num_test_episodes):
             o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
             while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time (noise_scale=0)
-                o, r, d, _ = test_env.step(get_action(o, 0))
+                # Take deterministic actions at test time 
+                o, r, d, _ = test_env.step(get_action(o, True))
                 ep_ret += r
                 ep_len += 1
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
@@ -288,9 +361,9 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards, 
-        # use the learned policy (with some noise, via act_noise). 
+        # use the learned policy. 
         if t > start_steps:
-            a = get_action(o, act_noise)
+            a = get_action(o)
         else:
             a = env.action_space.sample()
 
@@ -320,7 +393,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         if t >= update_after and t % update_every == 0:
             for j in range(update_every):
                 batch = replay_buffer.sample_batch(batch_size)
-                update(data=batch, timer=j)
+                update(data=batch)
 
         # End of epoch handling
         if (t+1) % steps_per_epoch == 0:
@@ -342,6 +415,7 @@ def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.log_tabular('TotalEnvInteracts', t)
             logger.log_tabular('Q1Vals', with_min_and_max=True)
             logger.log_tabular('Q2Vals', with_min_and_max=True)
+            logger.log_tabular('LogPi', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time()-start_time)
@@ -354,15 +428,20 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--eps', type=float, default=0.1)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--exp_name', type=str, default='td3')
+    parser.add_argument('--n_explore', type=int, default=4)
+    parser.add_argument('--exp_name', type=str, default='egl')
+    parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    td3(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
+    torch.set_num_threads(torch.get_num_threads())
+
+    egl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
+        logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore, device=device)

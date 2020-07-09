@@ -3,7 +3,7 @@
 import unittest
 from functools import partial
 
-import gym
+from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import tensorflow as tf
 
 from spinup import ppo_tf1 as ppo

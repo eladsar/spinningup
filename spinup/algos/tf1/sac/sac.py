@@ -1,6 +1,6 @@
 import numpy as np
 import tensorflow as tf
-import gym
+from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
 from spinup.algos.tf1.sac import core
 from spinup.algos.tf1.sac.core import get_vars

@@ -3,7 +3,7 @@ import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
+from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
 import spinup.algos.pytorch.td3.core as core
 from spinup.algos.pytorch.td3.td3 import td3 as true_td3

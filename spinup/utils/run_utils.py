@@ -19,6 +19,17 @@ from textwrap import dedent
 import time
 from tqdm import trange
 import zlib
+import socket
+
+
+def set_mujoco():
+    hostname = socket.gethostname()
+    path = os.path.join(os.path.expanduser('~'),'.mujoco')
+    name = 'mjkey.txt'
+    if os.path.exists(os.path.join(path, name)):
+        os.remove(os.path.join(path, name))
+    os.symlink(os.path.join(path, f'{name}.{hostname}'), os.path.join(path, name))
+
 
 DIV_LINE_WIDTH = 80
 
@@ -150,7 +161,7 @@ def call_experiment(exp_name, thunk, seed=0, num_cpu=1, data_dir=None,
     def thunk_plus():
         # Make 'env_fn' from 'env_name'
         if 'env_name' in kwargs:
-            import gym
+            from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
             env_name = kwargs['env_name']
             kwargs['env_fn'] = lambda : gym.make(env_name)
             del kwargs['env_name']

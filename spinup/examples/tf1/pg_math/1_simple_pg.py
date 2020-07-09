@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-import gym
+from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 from gym.spaces import Discrete, Box
 
 def mlp(x, sizes, activation=tf.tanh, output_activation=None):

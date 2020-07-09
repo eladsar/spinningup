@@ -249,7 +249,7 @@ See the documentation page for each algorithm for a complete account of possible
 
     from spinup import ppo_tf1 as ppo
     import tensorflow as tf
-    import gym
+    from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 
     env_fn = lambda : gym.make('LunarLander-v2')
 

@@ -69,13 +69,14 @@ class SquashedGaussianMLPActor(nn.Module):
 
 class MLPQFunction(nn.Module):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, output_size=1):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [output_size], activation)
 
     def forward(self, obs, act):
         q = self.q(torch.cat([obs, act], dim=-1))
         return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+
 
 class MLPActorCritic(nn.Module):
 
@@ -91,6 +92,7 @@ class MLPActorCritic(nn.Module):
         self.pi = SquashedGaussianMLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
         self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
         self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+        self.geps = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation, output_size=act_dim)
 
     def act(self, obs, deterministic=False):
         with torch.no_grad():

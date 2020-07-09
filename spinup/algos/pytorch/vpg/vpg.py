@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
+from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
 import spinup.algos.pytorch.vpg.core as core
 from spinup.utils.logx import EpochLogger

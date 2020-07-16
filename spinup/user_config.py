@@ -5,6 +5,7 @@ import pwd
 
 # Default neural network backend for each algo
 # (Must be either 'tf1' or 'pytorch')
+
 DEFAULT_BACKEND = {
     'vpg': 'pytorch',
     'trpo': 'tf1',
@@ -12,8 +13,13 @@ DEFAULT_BACKEND = {
     'ddpg': 'pytorch',
     'td3': 'pytorch',
     'sac': 'pytorch',
-    'egl': 'pytorch'
+    'egl': 'pytorch',
+    'rbi': 'pytorch',
 }
+
+for name in os.listdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'algos', 'pytorch')):
+    if name not in DEFAULT_BACKEND.keys():
+        DEFAULT_BACKEND[name] = 'pytorch'
 
 project_name = 'spinningup'
 username = pwd.getpwuid(os.geteuid()).pw_name

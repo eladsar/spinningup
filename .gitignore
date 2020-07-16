@@ -5,6 +5,7 @@ data/
 **/*.egg-info
 .python-version
 .idea/
+.configurations/
 .vscode/
 .DS_Store
 _build/

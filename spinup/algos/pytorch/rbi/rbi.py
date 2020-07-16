@@ -5,9 +5,13 @@ import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
-import spinup.algos.pytorch.sac.core as core
+import spinup.algos.pytorch.rbi.core as core
 from spinup.utils.logx import EpochLogger
+import math
+import torch.nn.functional as F
 from tqdm import tqdm
+import torch.autograd as autograd
+
 
 class ReplayBuffer:
     """
@@ -43,109 +47,23 @@ class ReplayBuffer:
         return {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k,v in batch.items()}
 
 
+def repeat_and_reshape(x, n):
 
-def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+    x_expand = x.repeat(n, *[1] * len(x.shape))
+    x_expand = x_expand.view(n * len(x), -1)
+
+    return x_expand
+
+
+def rbi(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=10000,
+        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=1000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, device='cuda'):
+        logger_kwargs=dict(), save_freq=1, eps=0.2, n_explore=32, device='cuda',
+        n_samples=100, cmin=0.25, cmax=1.75, greed=0.01, rand=0.01):
     """
-    Soft Actor-Critic (SAC)
-
-
-    Args:
-        env_fn : A function which creates a copy of the environment.
-            The environment must satisfy the OpenAI Gym API.
-
-        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
-            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
-            The ``act`` method and ``pi`` module should accept batches of 
-            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
-            of observations and a batch of actions as inputs. When called, 
-            ``act``, ``q1``, and ``q2`` should return:
-
-            ===========  ================  ======================================
-            Call         Output Shape      Description
-            ===========  ================  ======================================
-            ``act``      (batch, act_dim)  | Numpy array of actions for each 
-                                           | observation.
-            ``q1``       (batch,)          | Tensor containing one current estimate
-                                           | of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ``q2``       (batch,)          | Tensor containing the other current 
-                                           | estimate of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ===========  ================  ======================================
-
-            Calling ``pi`` should return:
-
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``a``        (batch, act_dim)  | Tensor containing actions from policy
-                                           | given observations.
-            ``logp_pi``  (batch,)          | Tensor containing log probabilities of
-                                           | actions in ``a``. Importantly: gradients
-                                           | should be able to flow back into ``a``.
-            ===========  ================  ======================================
-
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to SAC.
-
-        seed (int): Seed for random number generators.
-
-        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-            for the agent and the environment in each epoch.
-
-        epochs (int): Number of epochs to run and train agent.
-
-        replay_size (int): Maximum length of replay buffer.
-
-        gamma (float): Discount factor. (Always between 0 and 1.)
-
-        polyak (float): Interpolation factor in polyak averaging for target 
-            networks. Target networks are updated towards main networks 
-            according to:
-
-            .. math:: \\theta_{\\text{targ}} \\leftarrow 
-                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
-
-            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
-            close to 1.)
-
-        lr (float): Learning rate (used for both policy and value learning).
-
-        alpha (float): Entropy regularization coefficient. (Equivalent to 
-            inverse of reward scale in the original SAC paper.)
-
-        batch_size (int): Minibatch size for SGD.
-
-        start_steps (int): Number of steps for uniform-random action selection,
-            before running real policy. Helps exploration.
-
-        update_after (int): Number of env interactions to collect before
-            starting to do gradient descent updates. Ensures replay buffer
-            is full enough for useful updates.
-
-        update_every (int): Number of env interactions that should elapse
-            between gradient descent updates. Note: Regardless of how long 
-            you wait between updates, the ratio of env steps to gradient steps 
-            is locked to 1.
-
-        num_test_episodes (int): Number of episodes to test the deterministic
-            policy at the end of each epoch.
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
+    Rerouted Behavior Improvement (RBI)
     """
-
     device = torch.device(device)
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
@@ -176,14 +94,47 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n' % var_counts)
+
+    def max_reroute(o):
+
+        b, _ = o.shape
+        o = repeat_and_reshape(o, n_samples)
+        with torch.no_grad():
+            ai, _ = ac.pi(o)
+
+            q1 = ac.q1(o, ai)
+            q2 = ac.q2(o, ai)
+            qi = torch.min(q1, q2).unsqueeze(-1)
+
+        qi = qi.view(n_samples, b, 1)
+        ai = ai.view(n_samples, b, act_dim)
+        rank = torch.argsort(torch.argsort(qi, dim=0, descending=True), dim=0, descending=False)
+        w = cmin * torch.ones_like(ai)
+        m = int((1 - cmin) * n_samples / (cmax - cmin))
+
+        w += (cmax - cmin) * (rank < m).float()
+        w += ((1 - cmin) * n_samples - m * (cmax - cmin)) * (rank == m).float()
+
+        w -= greed
+        w += greed * n_samples * (rank == 0).float()
+
+        w = w * (1 - rand) + rand
+
+        w = w / w.sum(dim=0, keepdim=True)
+
+        prob = torch.distributions.Categorical(probs=w.permute(1, 2, 0))
+
+        a = torch.gather(ai.permute(1, 2, 0), 2, prob.sample().unsqueeze(2)).squeeze(2)
+
+        return a, (ai, w.mean(-1))
 
     # Set up function for computing SAC Q-losses
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        q1 = ac.q1(o,a)
-        q2 = ac.q2(o,a)
+        q1 = ac.q1(o, a)
+        q2 = ac.q2(o, a)
 
         # Bellman backup for Q functions
         with torch.no_grad():
@@ -210,13 +161,13 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
-        pi, logp_pi = ac.pi(o)
-        q1_pi = ac.q1(o, pi)
-        q2_pi = ac.q2(o, pi)
-        q_pi = torch.min(q1_pi, q2_pi)
+        _, (ai, w) = max_reroute(o)
 
+        pi, logp_pi = ac.pi(o)
+
+        log_ai = ac.pi.log_prob(ai)
         # Entropy-regularized policy loss
-        loss_pi = (alpha * logp_pi - q_pi).mean()
+        loss_pi = (alpha * logp_pi - (log_ai * w).sum(dim=0)).mean()
 
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
@@ -231,6 +182,7 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     logger.setup_pytorch_saver(ac)
 
     def update(data):
+
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, q_info = compute_loss_q(data)
@@ -267,8 +219,14 @@ def sac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 p_targ.data.add_((1 - polyak) * p.data)
 
     def get_action(o, deterministic=False):
-        return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device),
-                      deterministic)
+        o = torch.as_tensor(o, dtype=torch.float32, device=device)
+        if deterministic:
+            a = ac.act(o, deterministic)
+        else:
+            o = o.unsqueeze(0)
+            a, _ = max_reroute(o)
+            a = a.flatten().cpu().numpy()
+        return a
 
     def test_agent():
         for j in range(num_test_episodes):
@@ -357,10 +315,12 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--eps', type=float, default=0.2)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--n_explore', type=int, default=32)
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--exp_name', type=str, default='sac')
+    parser.add_argument('--exp_name', type=str, default='egl')
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
 
@@ -370,8 +330,8 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
-    print("SAC Experiment")
-    sac(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
+    rbi(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs, device=args.device, batch_size=args.batch_size)
+        logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,
+        device=args.device, batch_size=args.batch_size)

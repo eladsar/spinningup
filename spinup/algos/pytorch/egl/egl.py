@@ -7,6 +7,7 @@ from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
 import spinup.algos.pytorch.egl.core as core
 from spinup.utils.logx import EpochLogger
+from .spline_model import SparseDenseAdamOptimizer
 import math
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -62,16 +63,18 @@ def ball_explore(a1, n_explore, eps):
     mag = torch.zeros(n_explore, b, 1, device=a1.device).uniform_()
 
     x = x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
-    a2 = a1 + eps * math.sqrt(act_dim) * mag * x
+    # a2 = a1 + eps * math.sqrt(act_dim) * mag * x
+    a2 = a1 + eps * torch.pow(mag, 1 / act_dim) * x
 
     return a2
 
 
-def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
+def egl(env_fn, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=100, start_steps=10000, 
+        polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, eps=0.1, n_explore=32, device='cuda'):
+        logger_kwargs=dict(), save_freq=1, eps=0.4, n_explore=32, device='cuda',
+        architecture='mlp', sample='on_policy'):
     """
     Soft Actor-Critic (SAC)
 
@@ -168,6 +171,14 @@ def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             the current policy and value function.
 
     """
+
+    if architecture == 'mlp':
+        actor_critic = core.MLPActorCritic
+    elif architecture == 'spline':
+        actor_critic = core.SplineActorCritic
+    else:
+        raise NotImplementedError
+
     device = torch.device(device)
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
@@ -199,6 +210,45 @@ def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2, ac.geps])
     logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d, \t geps: %d\n'%var_counts)
+
+    n_samples = 100
+    cmin = 0.25
+    cmax = 1.75
+    greed = 0.01
+    rand = 0.01
+
+    def max_reroute(o):
+
+        b, _ = o.shape
+        o = repeat_and_reshape(o, n_samples)
+        with torch.no_grad():
+            ai, _ = ac.pi(o)
+
+            q1 = ac.q1(o, ai)
+            q2 = ac.q2(o, ai)
+            qi = torch.min(q1, q2).unsqueeze(-1)
+
+        qi = qi.view(n_samples, b, 1)
+        ai = ai.view(n_samples, b, act_dim)
+        rank = torch.argsort(torch.argsort(qi, dim=0, descending=True), dim=0, descending=False)
+        w = cmin * torch.ones_like(ai)
+        m = int((1 - cmin) * n_samples / (cmax - cmin))
+
+        w += (cmax - cmin) * (rank < m).float()
+        w += ((1 - cmin) * n_samples - m * (cmax - cmin)) * (rank == m).float()
+
+        w -= greed
+        w += greed * n_samples * (rank == 0).float()
+
+        w = w * (1 - rand) + rand
+
+        w = w / w.sum(dim=0, keepdim=True)
+
+        prob = torch.distributions.Categorical(probs=w.permute(1, 2, 0))
+
+        a = torch.gather(ai.permute(1, 2, 0), 2, prob.sample().unsqueeze(2)).squeeze(2)
+
+        return a, (ai, w.mean(-1))
 
     # Set up function for computing SAC Q-losses
     def compute_loss_q(data):
@@ -285,10 +335,18 @@ def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         return loss_pi, pi_info
 
-    # Set up optimizers for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
-    q_optimizer = Adam(q_params, lr=lr)
-    g_optimizer = Adam(ac.geps.parameters(), lr=lr)
+    if architecture == 'mlp':
+        # Set up optimizers for policy and q-function
+        pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
+        q_optimizer = Adam(q_params, lr=lr)
+        g_optimizer = Adam(ac.geps.parameters(), lr=lr)
+    elif architecture == 'spline':
+        # Set up optimizers for policy and q-function
+        pi_optimizer = SparseDenseAdamOptimizer(ac.pi, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
+        q_optimizer = SparseDenseAdamOptimizer([ac.q1, ac.q2], dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
+        g_optimizer = SparseDenseAdamOptimizer(ac.geps, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
+    else:
+        raise NotImplementedError
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
@@ -339,8 +397,25 @@ def egl(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 p_targ.data.mul_(polyak)
                 p_targ.data.add_((1 - polyak) * p.data)
 
-    def get_action(o, deterministic=False):
+    def get_action_on_policy(o, deterministic=False):
         return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device), deterministic)
+
+    def get_action_rbi(o, deterministic=False):
+        o = torch.as_tensor(o, dtype=torch.float32, device=device)
+        if deterministic:
+            a = ac.act(o, deterministic)
+        else:
+            o = o.unsqueeze(0)
+            a, _ = max_reroute(o)
+            a = a.flatten().cpu().numpy()
+        return a
+
+    if sample == 'on_policy':
+        get_action = get_action_on_policy
+    elif sample == 'rbi':
+        get_action = get_action_rbi
+    else:
+        raise NotImplementedError
 
     def test_agent():
         for j in range(num_test_episodes):
@@ -429,12 +504,15 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--eps', type=float, default=0.2)
+    parser.add_argument('--eps', type=float, default=0.4)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--n_explore', type=int, default=4)
+    parser.add_argument('--n_explore', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--exp_name', type=str, default='egl')
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--architecture', type=str, default='mlp', help='[mlp|spline]')
+    parser.add_argument('--sample', type=str, default='on_policy', help='[on_policy|rbi]')
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
@@ -443,8 +521,9 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
+    print("EGL Experiment")
     egl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
         logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,
-        device=args.device, batch_size=args.batch_size)
+        device=args.device, batch_size=args.batch_size, architecture=args.architecture, sample=args.sample)

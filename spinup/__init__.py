@@ -1,6 +1,9 @@
 # Disable TF deprecation warnings.
 # Syntax from tf1 is not expected to be compatible with tf2.
 import tensorflow as tf
+import importlib
+import os
+
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 # Algorithms
@@ -11,13 +14,18 @@ from spinup.algos.tf1.td3.td3 import td3 as td3_tf1
 from spinup.algos.tf1.trpo.trpo import trpo as trpo_tf1
 from spinup.algos.tf1.vpg.vpg import vpg as vpg_tf1
 
-from spinup.algos.pytorch.ddpg.ddpg import ddpg as ddpg_pytorch
-from spinup.algos.pytorch.ppo.ppo import ppo as ppo_pytorch
-from spinup.algos.pytorch.sac.sac import sac as sac_pytorch
-from spinup.algos.pytorch.td3.td3 import td3 as td3_pytorch
-from spinup.algos.pytorch.trpo.trpo import trpo as trpo_pytorch
-from spinup.algos.pytorch.vpg.vpg import vpg as vpg_pytorch
-from spinup.algos.pytorch.egl.egl import egl as egl_pytorch
+for name in os.listdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'algos', 'pytorch')):
+    module = importlib.import_module(f".{name}", package=f"spinup.algos.pytorch.{name}")
+    globals()[f'{name}_pytorch'] = getattr(module, name)
+
+# from spinup.algos.pytorch.ddpg.ddpg import ddpg as ddpg_pytorch
+# from spinup.algos.pytorch.ppo.ppo import ppo as ppo_pytorch
+# from spinup.algos.pytorch.sac.sac import sac as sac_pytorch
+# from spinup.algos.pytorch.td3.td3 import td3 as td3_pytorch
+# from spinup.algos.pytorch.trpo.trpo import trpo as trpo_pytorch
+# from spinup.algos.pytorch.vpg.vpg import vpg as vpg_pytorch
+# from spinup.algos.pytorch.egl.egl import egl as egl_pytorch
+# from spinup.algos.pytorch.rbi.rbi import rbi as rbi_pytorch
 
 # Loggers
 from spinup.utils.logx import Logger, EpochLogger

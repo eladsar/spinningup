@@ -87,7 +87,10 @@ def parse_and_execute_grid_search(cmd, args):
 
     if 'exp_name' not in arg_dict:
         arg_dict['exp_name'] = ['debug']
-    arg_dict['exp_name'][0] = f"{algo_name}_{arg_dict['exp_name'][0]}"
+
+    env_name = arg_dict['env'][0].split('-')[0].lower()
+
+    arg_dict['exp_name'][0] = f"{env_name}_{algo_name}_{arg_dict['exp_name'][0]}"
 
     # Make second pass through, to catch flags that have no vals.
     # Assume such flags indicate that a boolean parameter should have

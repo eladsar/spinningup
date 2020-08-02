@@ -5,14 +5,18 @@ import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
-import spinup.algos.pytorch.egl.core as core
+import spinup.algos.pytorch.nsac.core as core
 from spinup.utils.logx import EpochLogger
-from .spline_model import SparseDenseAdamOptimizer
-import math
-import torch.nn.functional as F
 from tqdm import tqdm
-import torch.autograd as autograd
 
+
+def soft_update(source, dest, polyak):
+    with torch.no_grad():
+        for p, p_targ in zip(source.parameters(), dest.parameters()):
+            # NB: We use an in-place operations "mul_", "add_" to update target
+            # params, as opposed to "mul" and "add", which would make new tensors.
+            p_targ.data.mul_(polyak)
+            p_targ.data.add_((1 - polyak) * p.data)
 
 class ReplayBuffer:
     """
@@ -48,35 +52,11 @@ class ReplayBuffer:
         return {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k,v in batch.items()}
 
 
-def repeat_and_reshape(x, n):
-
-    x_expand = x.repeat(n, *[1] * len(x.shape))
-    x_expand = x_expand.view(n * len(x), -1)
-
-    return x_expand
-
-
-def ball_explore(a1, n_explore, eps):
-
-    b, act_dim = a1.shape
-    a1 = a1.unsqueeze(0)
-    x = torch.zeros_like(a1).normal_()
-    mag = torch.zeros(n_explore, b, 1, device=a1.device).uniform_()
-
-    x = x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
-    a2 = a1 + eps * math.sqrt(act_dim) * mag * x
-    # a2 = a1 + eps * mag * x
-    # a2 = a1 + eps * torch.pow(mag, 1 / act_dim) * x
-
-    return a2
-
-
-def egl(env_fn, ac_kwargs=dict(), seed=0,
+def nsac(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, eps=0.4, n_explore=32, device='cuda',
-        architecture='mlp', sample='on_policy'):
+        logger_kwargs=dict(), save_freq=1, device='cuda'):
     """
     Soft Actor-Critic (SAC)
 
@@ -174,13 +154,6 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
 
     """
 
-    if architecture == 'mlp':
-        actor_critic = core.MLPActorCritic
-    elif architecture == 'spline':
-        actor_critic = core.SplineActorCritic
-    else:
-        raise NotImplementedError
-
     device = torch.device(device)
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
@@ -210,63 +183,32 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2, ac.geps])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d, \t geps: %d\n'%var_counts)
-
-    n_samples = 100
-    cmin = 0.25
-    cmax = 1.75
-    greed = 0.01
-    rand = 0.01
-
-    def max_reroute(o):
-
-        b, _ = o.shape
-        o = repeat_and_reshape(o, n_samples)
-        with torch.no_grad():
-            ai, _ = ac.pi(o)
-
-            q1 = ac.q1(o, ai)
-            q2 = ac.q2(o, ai)
-            qi = torch.min(q1, q2).unsqueeze(-1)
-
-        qi = qi.view(n_samples, b, 1)
-        ai = ai.view(n_samples, b, act_dim)
-        rank = torch.argsort(torch.argsort(qi, dim=0, descending=True), dim=0, descending=False)
-        w = cmin * torch.ones_like(ai)
-        m = int((1 - cmin) * n_samples / (cmax - cmin))
-
-        w += (cmax - cmin) * (rank < m).float()
-        w += ((1 - cmin) * n_samples - m * (cmax - cmin)) * (rank == m).float()
-
-        w -= greed
-        w += greed * n_samples * (rank == 0).float()
-
-        w = w * (1 - rand) + rand
-
-        w = w / w.sum(dim=0, keepdim=True)
-
-        prob = torch.distributions.Categorical(probs=w.permute(1, 2, 0))
-
-        a = torch.gather(ai.permute(1, 2, 0), 2, prob.sample().unsqueeze(2)).squeeze(2)
-
-        return a, (ai, w.mean(-1))
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
+    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
 
     # Set up function for computing SAC Q-losses
     def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        q1 = ac.q1(o,a)
-        q2 = ac.q2(o,a)
+        with torch.no_grad():
+            _, _, _ = ac_targ.pi(o)
+            a = ac_targ.pi.normalize(a)
+
+        q1 = ac.q1(o, a, distribution=ac_targ.pi.distribution)
+        q2 = ac.q2(o, a, distribution=ac_targ.pi.distribution)
 
         # Bellman backup for Q functions
         with torch.no_grad():
             # Target actions come from *current* policy
-            a2, logp_a2 = ac.pi(o2)
+
+            _, _, _ = ac_targ.pi(o2)
+
+            _, logp_a2, a2 = ac.pi(o2, distribution=ac_targ.pi.distribution)
+            # a2, logp_a2, _ = ac.pi(o2, distribution=ac_targ.pi.distribution)
 
             # Target Q-values
-            q1_pi_targ = ac_targ.q1(o2, a2)
-            q2_pi_targ = ac_targ.q2(o2, a2)
+            q1_pi_targ = ac_targ.q1(o2, a2, distribution=ac_targ.pi.distribution)
+            q2_pi_targ = ac_targ.q2(o2, a2, distribution=ac_targ.pi.distribution)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
 
@@ -281,130 +223,36 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
 
         return loss_q, q_info
 
-    # # Set up function for computing EGL mean-gradient-losses
-    # def compute_loss_g(data):
-    #
-    #     o, a1, r, o_tag, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-    #
-    #     a2 = ball_explore(a1, n_explore, eps)
-    #
-    #     a2 = a2.view(n_explore * len(r), act_dim)
-    #     o_expand = repeat_and_reshape(o, n_explore)
-    #
-    #     # Bellman backup for Q functions
-    #     with torch.no_grad():
-    #
-    #         q1 = ac.q1(o_expand, a2)
-    #         q2 = ac.q2(o_expand, a2)
-    #         q_dither = torch.min(q1, q2)
-    #
-    #         # Target actions come from *current* policy
-    #         a_tag, logp_a_tag = ac.pi(o_tag)
-    #
-    #         # Target Q-values
-    #         q1_pi_targ = ac_targ.q1(o_tag, a_tag)
-    #         q2_pi_targ = ac_targ.q2(o_tag, a_tag)
-    #         q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-    #         q_anchor = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a_tag)
-    #
-    #         q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
-    #
-    #     geps = ac.geps(o, a1)
-    #     geps = repeat_and_reshape(geps, n_explore)
-    #     a1 = repeat_and_reshape(a1, n_explore)
-    #
-    #     geps = (geps * (a2 - a1)).sum(-1)
-    #     # l1 loss against Bellman backup
-    #
-    #     loss_g = F.smooth_l1_loss(geps, q_dither - q_anchor)
-    #
-    #     # Useful info for logging
-    #     g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
-    #
-    #     return loss_g, g_info
-
-    # Set up function for computing EGL mean-gradient-losses
-    def compute_loss_g(data):
-        o, a1, r, o_tag, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
-        a2 = ball_explore(a1, n_explore, eps)
-
-        a2 = a2.view(n_explore * len(r), act_dim)
-        o_expand = repeat_and_reshape(o, n_explore)
-
-        # Bellman backup for Q functions
-        with torch.no_grad():
-            q1 = ac.q1(o_expand, a2)
-            q2 = ac.q2(o_expand, a2)
-            q_dither = torch.min(q1, q2)
-
-            # Target actions come from *current* policy
-
-            # Target Q-values
-            q1 = ac.q1(o, a1)
-            q2 = ac.q2(o, a1)
-            q_anchor = torch.min(q1, q2)
-
-            q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
-
-        geps = ac.geps(o, a1)
-        geps = repeat_and_reshape(geps, n_explore)
-        a1 = repeat_and_reshape(a1, n_explore)
-
-        geps = (geps * (a2 - a1)).sum(-1)
-        # l1 loss against Bellman backup
-
-        loss_g = F.smooth_l1_loss(geps, q_dither - q_anchor)
-
-        # Useful info for logging
-        g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
-
-        return loss_g, g_info
-
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
-        pi, logp_pi = ac.pi(o)
-        geps_pi = ac.geps(o, pi)
+
+        with torch.no_grad():
+            _, _, _ = ac_targ.pi(o)
+
+        _, logp_pi, pi = ac.pi(o, distribution=ac_targ.pi.distribution)
+        # pi, logp_pi, _ = ac.pi(o, distribution=ac_targ.pi.distribution)
+
+        q1_pi = ac.q1(o, pi, distribution=ac_targ.pi.distribution)
+        q2_pi = ac.q2(o, pi, distribution=ac_targ.pi.distribution)
+        q_pi = torch.min(q1_pi, q2_pi)
 
         # Entropy-regularized policy loss
-        loss_pi = (alpha * logp_pi - (geps_pi * pi).sum(-1)).mean()
-
-        beta = autograd.Variable(pi.detach().clone(), requires_grad=True)
-        q1_pi = ac.q1(o, beta)
-        q2_pi = ac.q2(o, beta)
-        qa = torch.min(q1_pi, q2_pi).unsqueeze(-1)
-
-        grad_q = autograd.grad(outputs=qa, inputs=beta, grad_outputs=torch.cuda.FloatTensor(qa.size()).fill_(1.),
-                                  create_graph=False, retain_graph=False, only_inputs=True)[0]
+        loss_pi = (alpha * logp_pi - q_pi).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy(),
-                       GradGAmp=torch.norm(geps_pi, dim=-1).detach().cpu().numpy(),
-                       GradQAmp=torch.norm(grad_q, dim=-1).detach().cpu().numpy(),
-                       GradDelta=torch.norm(geps_pi - grad_q, dim=-1).detach().cpu().numpy(),
-                       GradSim=F.cosine_similarity(geps_pi, grad_q, dim=-1).detach().cpu().numpy(),)
+        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
 
         return loss_pi, pi_info
 
-    if architecture == 'mlp':
-        # Set up optimizers for policy and q-function
-        pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
-        q_optimizer = Adam(q_params, lr=lr)
-        g_optimizer = Adam(ac.geps.parameters(), lr=lr)
-    elif architecture == 'spline':
-        # Set up optimizers for policy and q-function
-        pi_optimizer = SparseDenseAdamOptimizer(ac.pi, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
-        q_optimizer = SparseDenseAdamOptimizer([ac.q1, ac.q2], dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
-        g_optimizer = SparseDenseAdamOptimizer(ac.geps, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
-    else:
-        raise NotImplementedError
+    # Set up optimizers for policy and q-function
+    pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
+    q_optimizer = Adam(q_params, lr=lr)
 
     # Set up model saving
     logger.setup_pytorch_saver(ac)
 
     def update(data):
-
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, q_info = compute_loss_q(data)
@@ -414,18 +262,9 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
         # Record things
         logger.store(LossQ=loss_q.item(), **q_info)
 
-        # Next run one gradient descent step for the mean-gradient
-        g_optimizer.zero_grad()
-        loss_g, g_info = compute_loss_g(data)
-        loss_g.backward()
-        g_optimizer.step()
-
-        # Record things
-        logger.store(LossG=loss_g.item(), **g_info)
-
         # Freeze Q-networks so you don't waste computational effort 
         # computing gradients for them during the policy learning step.
-        for p in ac.geps.parameters():
+        for p in q_params:
             p.requires_grad = False
 
         # Next run one gradient descent step for pi.
@@ -435,39 +274,21 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
         pi_optimizer.step()
 
         # Unfreeze Q-networks so you can optimize it at next DDPG step.
-        for p in ac.geps.parameters():
+        for p in q_params:
             p.requires_grad = True
 
         # Record things
         logger.store(LossPi=loss_pi.item(), **pi_info)
 
         # Finally, update target networks by polyak averaging.
-        with torch.no_grad():
-            for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
-                # NB: We use an in-place operations "mul_", "add_" to update target
-                # params, as opposed to "mul" and "add", which would make new tensors.
-                p_targ.data.mul_(polyak)
-                p_targ.data.add_((1 - polyak) * p.data)
+        soft_update(ac.q1, ac_targ.q1, polyak)
+        soft_update(ac.q2, ac_targ.q2, polyak)
+        soft_update(ac.pi, ac_targ.pi, 1)
+        # soft_update(ac.pi, ac_targ.pi, 1 - (1 - polyak) * 0.5)
 
-    def get_action_on_policy(o, deterministic=False):
-        return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device), deterministic)
-
-    def get_action_rbi(o, deterministic=False):
-        o = torch.as_tensor(o, dtype=torch.float32, device=device)
-        if deterministic:
-            a = ac.act(o, deterministic)
-        else:
-            o = o.unsqueeze(0)
-            a, _ = max_reroute(o)
-            a = a.flatten().cpu().numpy()
-        return a
-
-    if sample == 'on_policy':
-        get_action = get_action_on_policy
-    elif sample == 'rbi':
-        get_action = get_action_rbi
-    else:
-        raise NotImplementedError
+    def get_action(o, deterministic=False):
+        return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device),
+                      deterministic)
 
     def test_agent():
         for j in range(num_test_episodes):
@@ -546,14 +367,6 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
             logger.log_tabular('LogPi', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
-
-            logger.log_tabular('GVals', with_min_and_max=True)
-            logger.log_tabular('LossG', with_min_and_max=True)
-            logger.log_tabular('GradGAmp', with_min_and_max=True)
-            logger.log_tabular('GradQAmp', with_min_and_max=True)
-            logger.log_tabular('GradDelta', with_min_and_max=True)
-            logger.log_tabular('GradSim', with_min_and_max=True)
-
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
 
@@ -564,15 +377,11 @@ if __name__ == '__main__':
     parser.add_argument('--hid', type=int, default=256)
     parser.add_argument('--l', type=int, default=2)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--eps', type=float, default=0.4)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--n_explore', type=int, default=32)
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--exp_name', type=str, default='egl')
+    parser.add_argument('--exp_name', type=str, default='sac')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--architecture', type=str, default='mlp', help='[mlp|spline]')
-    parser.add_argument('--sample', type=str, default='on_policy', help='[on_policy|rbi]')
     args = parser.parse_args()
 
     from spinup.utils.run_utils import setup_logger_kwargs
@@ -581,9 +390,8 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
-    print("EGL Experiment")
-    egl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
+    print("NSAC Experiment")
+    nsac(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,
-        device=args.device, batch_size=args.batch_size, architecture=args.architecture, sample=args.sample)
+        logger_kwargs=logger_kwargs, device=args.device, batch_size=args.batch_size)

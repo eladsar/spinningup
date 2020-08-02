@@ -20,18 +20,24 @@ import time
 from tqdm import trange
 import zlib
 import socket
+import tempfile
+
+
+def get_tempfile_name(tmpdir):
+    return os.path.join(tmpdir, next(tempfile._get_candidate_names()))
 
 
 def set_mujoco():
     hostname = socket.gethostname()
     path = os.path.join(os.path.expanduser('~'),'.mujoco')
     name = 'mjkey.txt'
-    if os.path.exists(os.path.join(path, name)):
-        os.remove(os.path.join(path, name))
-    os.symlink(os.path.join(path, f'{name}.{hostname}'), os.path.join(path, name))
+    tmp = get_tempfile_name(path)
+    os.symlink(os.path.join(path, f'{name}.{hostname}'), tmp)
+    os.rename(tmp, os.path.join(path, name))
 
 
 DIV_LINE_WIDTH = 80
+
 
 def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
     """
@@ -79,14 +85,15 @@ def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
     datestamp = datestamp or FORCE_DATESTAMP
 
     # Make base path
-    ymd_time = time.strftime("%Y%m%d_%H%M%S") if datestamp else ''
-    relpath = f"{exp_name}_{ymd_time}"
+    # ymd_time = time.strftime("%Y%m%d_%H%M%S") if datestamp else ''
+    # relpath = f"{exp_name}_{ymd_time}"
+    relpath = exp_name
     
     if seed is not None:
         # Make a seed-specific subfolder in the experiment directory.
         if datestamp:
-            hms_time = time.strftime("%Y-%m-%d_%H-%M-%S")
-            subfolder = ''.join([hms_time, '-', exp_name, '_s', str(seed)])
+            hms_time = time.strftime("%Y%m%d_%H%M%S")
+            subfolder = ''.join([hms_time, '_', exp_name, '_s', str(seed)])
         else:
             subfolder = ''.join([exp_name, '_s', str(seed)])
         relpath = osp.join(relpath, subfolder)

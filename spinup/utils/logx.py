@@ -15,6 +15,8 @@ import os.path as osp, time, atexit, os
 import warnings
 from spinup.utils.mpi_tools import proc_id, mpi_statistics_scalar
 from spinup.utils.serialization_utils import convert_json
+from shutil import copytree
+from fnmatch import filter as filter_pattern
 
 color2num = dict(
     gray=30,
@@ -27,6 +29,24 @@ color2num = dict(
     white=37,
     crimson=38
 )
+
+def include_patterns(*patterns):
+    """Factory function that can be used with copytree() ignore parameter.
+
+    Arguments define a sequence of glob-style patterns
+    that are used to specify what files to NOT ignore.
+    Creates and returns a function that determines this for each directory
+    in the file hierarchy rooted at the source directory when used with
+    shutil.copytree().
+    """
+    def _ignore_patterns(path, names):
+        keep = set(name for pattern in patterns
+                            for name in filter_pattern(names, pattern))
+        ignore = set(name for name in names
+                        if name not in keep and not os.path.isdir(os.path.join(path, name)))
+        return ignore
+    return _ignore_patterns
+
 
 def colorize(string, color, bold=False, highlight=False):
     """
@@ -104,6 +124,13 @@ class Logger:
             self.output_file = open(osp.join(self.output_dir, output_fname), 'w')
             atexit.register(self.output_file.close)
             print(colorize("Logging data to %s"%self.output_file.name, 'green', bold=True))
+
+            # Log all code files
+            code_dir = os.path.join(self.output_dir, 'code')
+            code_root = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..'))
+            copytree(code_root, code_dir,
+                     ignore=include_patterns('*.py', '*.md', '*.ipynb'))
+
         else:
             self.output_dir = None
             self.output_file = None

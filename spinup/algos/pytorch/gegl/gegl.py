@@ -5,13 +5,47 @@ import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
-import spinup.algos.pytorch.egl.core as core
+import spinup.algos.pytorch.gegl.core as core
 from spinup.utils.logx import EpochLogger
 from .spline_model import SparseDenseAdamOptimizer
+import torch.autograd as autograd
 import math
 import torch.nn.functional as F
 from tqdm import tqdm
-import torch.autograd as autograd
+
+
+def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
+    bz, nz, _ = S.shape
+    z_hat = z_hat.view(bz, nz, 1)
+
+    X_Cnz = torch.randn(bz, nz, m_FA, device=z_hat.device)
+
+    rss_array = torch.sqrt(torch.sum(torch.square(X_Cnz), dim=1, keepdim=True))
+
+    kron_prod = rss_array.repeat_interleave(nz, dim=1)
+
+    X_Cnz = X_Cnz / kron_prod  # Points uniformly distributed on hypersphere surface
+
+    R = torch.ones(bz, nz, 1, device=z_hat.device) * (
+        torch.pow(torch.rand(bz, 1, m_FA, device=z_hat.device), (1. / nz)))
+
+    unif_sph = R * X_Cnz  # m_FA points within the hypersphere
+    T = torch.cholesky(S)  # Cholesky factorization of S => S=T’T
+
+    unif_ell = torch.bmm(T.transpose(1, 2), unif_sph)
+
+    # Translation and scaling about the center
+    z_fa = (unif_ell * math.sqrt(Gamma_Threshold) + (z_hat * torch.ones(bz, 1, m_FA, device=z_hat.device)))
+
+    return z_fa.permute(2, 0, 1)
+
+
+def explore(a1, n_explore, eps):
+
+    S = torch.diag_embed(eps)
+    a2 = sample_ellipsoid(S, a1, n_explore)
+
+    return a2
 
 
 class ReplayBuffer:
@@ -53,126 +87,16 @@ def repeat_and_reshape(x, n):
     x_expand = x.repeat(n, *[1] * len(x.shape))
     x_expand = x_expand.view(n * len(x), -1)
 
-    return x_expand
+    return x_expand.squeeze(1)
 
 
-def ball_explore(a1, n_explore, eps):
-
-    b, act_dim = a1.shape
-    a1 = a1.unsqueeze(0)
-    x = torch.zeros_like(a1).normal_()
-    mag = torch.zeros(n_explore, b, 1, device=a1.device).uniform_()
-
-    x = x / (torch.norm(x, dim=-1, keepdim=True) + 1e-8)
-    a2 = a1 + eps * math.sqrt(act_dim) * mag * x
-    # a2 = a1 + eps * mag * x
-    # a2 = a1 + eps * torch.pow(mag, 1 / act_dim) * x
-
-    return a2
-
-
-def egl(env_fn, ac_kwargs=dict(), seed=0,
+def gegl(env_fn, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=10000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1, eps=0.4, n_explore=32, device='cuda',
+        logger_kwargs=dict(), save_freq=1, eps=0.4, n_explore=32, update_factor=1, device='cuda',
         architecture='mlp', sample='on_policy'):
-    """
-    Soft Actor-Critic (SAC)
 
-
-    Args:
-        env_fn : A function which creates a copy of the environment.
-            The environment must satisfy the OpenAI Gym API.
-
-        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
-            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
-            The ``act`` method and ``pi`` module should accept batches of 
-            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
-            of observations and a batch of actions as inputs. When called, 
-            ``act``, ``q1``, and ``q2`` should return:
-
-            ===========  ================  ======================================
-            Call         Output Shape      Description
-            ===========  ================  ======================================
-            ``act``      (batch, act_dim)  | Numpy array of actions for each 
-                                           | observation.
-            ``q1``       (batch,)          | Tensor containing one current estimate
-                                           | of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ``q2``       (batch,)          | Tensor containing the other current 
-                                           | estimate of Q* for the provided observations
-                                           | and actions. (Critical: make sure to
-                                           | flatten this!)
-            ===========  ================  ======================================
-
-            Calling ``pi`` should return:
-
-            ===========  ================  ======================================
-            Symbol       Shape             Description
-            ===========  ================  ======================================
-            ``a``        (batch, act_dim)  | Tensor containing actions from policy
-                                           | given observations.
-            ``logp_pi``  (batch,)          | Tensor containing log probabilities of
-                                           | actions in ``a``. Importantly: gradients
-                                           | should be able to flow back into ``a``.
-            ===========  ================  ======================================
-
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to SAC.
-
-        seed (int): Seed for random number generators.
-
-        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
-            for the agent and the environment in each epoch.
-
-        epochs (int): Number of epochs to run and train agent.
-
-        replay_size (int): Maximum length of replay buffer.
-
-        gamma (float): Discount factor. (Always between 0 and 1.)
-
-        polyak (float): Interpolation factor in polyak averaging for target 
-            networks. Target networks are updated towards main networks 
-            according to:
-
-            .. math:: \\theta_{\\text{targ}} \\leftarrow 
-                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
-
-            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
-            close to 1.)
-
-        lr (float): Learning rate (used for both policy and value learning).
-
-        alpha (float): Entropy regularization coefficient. (Equivalent to 
-            inverse of reward scale in the original SAC paper.)
-
-        batch_size (int): Minibatch size for SGD.
-
-        start_steps (int): Number of steps for uniform-random action selection,
-            before running real policy. Helps exploration.
-
-        update_after (int): Number of env interactions to collect before
-            starting to do gradient descent updates. Ensures replay buffer
-            is full enough for useful updates.
-
-        update_every (int): Number of env interactions that should elapse
-            between gradient descent updates. Note: Regardless of how long 
-            you wait between updates, the ratio of env steps to gradient steps 
-            is locked to 1.
-
-        num_test_episodes (int): Number of episodes to test the deterministic
-            policy at the end of each epoch.
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
-    """
 
     if architecture == 'mlp':
         actor_critic = core.MLPActorCritic
@@ -281,23 +205,75 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
 
         return loss_q, q_info
 
+    # Set up function for computing EGL mean-gradient-losses
+    def compute_loss_g(data):
+
+        o = data['obs']
+
+        # Bellman backup for Q functions
+        with torch.no_grad():
+
+            _, _ = ac.pi(o)
+
+            a1 = ac.pi.sample(None)
+            std = torch.exp(ac.pi.distribution.logscale)
+            std = torch.clamp_max(std, max=eps)
+
+            a2 = explore(a1, n_explore, std)
+
+            q1_dither = ac.q1(o, a2)
+            q2_dither = ac.q2(o, a2)
+
+            q_dither = (q1_dither + q2_dither) / 2
+
+            q1_anchor = ac.q1(o, a1)
+            q2_anchor = ac.q2(o, a1)
+
+            q_anchor = (q1_anchor + q2_anchor) / 2
+
+        geps = ac.geps(o, a1)
+        geps = (geps * (a2 - a1)).sum(-1)
+
+        # mse loss against Bellman backup
+        loss_g = F.mse_loss(geps, (q_dither - q_anchor))
+
+        # Useful info for logging
+        g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
+
+        return loss_g, g_info
+
     # # Set up function for computing EGL mean-gradient-losses
     # def compute_loss_g(data):
-    #
     #     o, a1, r, o_tag, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
     #
-    #     a2 = ball_explore(a1, n_explore, eps)
+    #     _, _ = ac.pi(o)
+    #
+    #     a2 = ac.pi.sample(n_explore, ratio=.1, mean=a1)
+    #     # a2 = ac.pi.sample(n_explore, ratio=0.5)
     #
     #     a2 = a2.view(n_explore * len(r), act_dim)
     #     o_expand = repeat_and_reshape(o, n_explore)
     #
     #     # Bellman backup for Q functions
     #     with torch.no_grad():
-    #
     #         q1 = ac.q1(o_expand, a2)
     #         q2 = ac.q2(o_expand, a2)
     #         q_dither = torch.min(q1, q2)
     #
+    #         # # Target actions come from *current* policy
+    #         # a_tag, logp_a_tag = ac.pi(o_tag)
+    #         #
+    #         # # Target Q-values
+    #         # q1_pi_targ = ac_targ.q1(o_tag, a_tag)
+    #         # q2_pi_targ = ac_targ.q2(o_tag, a_tag)
+    #         # q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+    #         # q_anchor = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a_tag)
+    #         #
+    #         # q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
+    #
+    #         o_tag = repeat_and_reshape(o_tag, n_explore)
+    #         d = repeat_and_reshape(d, n_explore)
+    #         r = repeat_and_reshape(r, n_explore)
     #         # Target actions come from *current* policy
     #         a_tag, logp_a_tag = ac.pi(o_tag)
     #
@@ -307,59 +283,25 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
     #         q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
     #         q_anchor = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a_tag)
     #
-    #         q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
-    #
     #     geps = ac.geps(o, a1)
     #     geps = repeat_and_reshape(geps, n_explore)
     #     a1 = repeat_and_reshape(a1, n_explore)
     #
     #     geps = (geps * (a2 - a1)).sum(-1)
-    #     # l1 loss against Bellman backup
     #
-    #     loss_g = F.smooth_l1_loss(geps, q_dither - q_anchor)
+    #     # w = 1 / (a2 - a1).norm(dim=1)
+    #     # w = w / w.max()
+    #     # # l1 loss against Bellman backup
+    #     # loss_g = F.smooth_l1_loss(geps * w, (q_dither - q_anchor) * w)
+    #
+    #     # mse loss against Bellman backup
+    #     loss_g = F.mse_loss(geps, (q_dither - q_anchor))
     #
     #     # Useful info for logging
     #     g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
     #
     #     return loss_g, g_info
 
-    # Set up function for computing EGL mean-gradient-losses
-    def compute_loss_g(data):
-        o, a1, r, o_tag, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
-        a2 = ball_explore(a1, n_explore, eps)
-
-        a2 = a2.view(n_explore * len(r), act_dim)
-        o_expand = repeat_and_reshape(o, n_explore)
-
-        # Bellman backup for Q functions
-        with torch.no_grad():
-            q1 = ac.q1(o_expand, a2)
-            q2 = ac.q2(o_expand, a2)
-            q_dither = torch.min(q1, q2)
-
-            # Target actions come from *current* policy
-
-            # Target Q-values
-            q1 = ac.q1(o, a1)
-            q2 = ac.q2(o, a1)
-            q_anchor = torch.min(q1, q2)
-
-            q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
-
-        geps = ac.geps(o, a1)
-        geps = repeat_and_reshape(geps, n_explore)
-        a1 = repeat_and_reshape(a1, n_explore)
-
-        geps = (geps * (a2 - a1)).sum(-1)
-        # l1 loss against Bellman backup
-
-        loss_g = F.smooth_l1_loss(geps, q_dither - q_anchor)
-
-        # Useful info for logging
-        g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
-
-        return loss_g, g_info
 
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
@@ -519,7 +461,7 @@ def egl(env_fn, ac_kwargs=dict(), seed=0,
 
         # Update handling
         if t >= update_after and t % update_every == 0:
-            for j in range(update_every):
+            for j in range(update_every * update_factor):
                 batch = replay_buffer.sample_batch(batch_size)
                 update(data=batch)
 
@@ -582,7 +524,7 @@ if __name__ == '__main__':
     torch.set_num_threads(torch.get_num_threads())
 
     print("EGL Experiment")
-    egl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
+    gegl(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
         logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,

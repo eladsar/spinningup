@@ -25,7 +25,7 @@ project_name = 'spinningup'
 username = pwd.getpwuid(os.geteuid()).pw_name
 
 if "gpu" in socket.gethostname():
-    root_path = os.path.join('/mnt/dsi_vol1/users', 'data', project_name)
+    root_path = os.path.join('/mnt/dsi_vol1/users', username, 'data', project_name)
 elif "root" == username:
     root_path = os.path.join('/data/data', project_name)
 else:

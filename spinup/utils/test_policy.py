@@ -113,7 +113,7 @@ def load_pytorch_policy(fpath, itr, deterministic=False):
     return get_action, model
 
 
-def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True, sleep=1e-3):
+def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True, sleep=1e-3, model=None, prob=False):
 
     assert env is not None, \
         "Environment not found!\n\n It looks like the environment wasn't saved, " + \
@@ -133,7 +133,13 @@ def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True, 
         o, r, d, _ = env.step(a)
         ep_ret += r
         ep_len += 1
-        yield {'img': img, 'a': a, 'r': r, 'd': d, 'score': ep_ret, 't': ep_len, 'o': o_prev}
+        results = {'img': img, 'a': a, 'r': r, 'd': d, 'score': ep_ret, 't': ep_len, 'o': o_prev}
+
+        # if model is not None and prob and hasattr(model.pi, 'distribution'):
+        #
+        #     mu = torch.tanh(model.pi.)
+
+        yield results
 
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)

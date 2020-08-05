@@ -26,8 +26,10 @@ def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
 
     X_Cnz = X_Cnz / kron_prod  # Points uniformly distributed on hypersphere surface
 
-    R = torch.ones(bz, nz, 1, device=z_hat.device) * (
-        torch.pow(torch.rand(bz, 1, m_FA, device=z_hat.device), (1. / nz)))
+    # R = torch.ones(bz, nz, 1, device=z_hat.device) * (
+    #     torch.pow(torch.rand(bz, 1, m_FA, device=z_hat.device), (1. / nz)))
+
+    R = torch.ones(bz, nz, 1, device=z_hat.device) * (torch.rand(bz, 1, m_FA, device=z_hat.device))
 
     unif_sph = R * X_Cnz  # m_FA points within the hypersphere
     T = torch.cholesky(S)  # Cholesky factorization of S => S=T’T
@@ -43,7 +45,7 @@ def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
 def explore(a1, n_explore, eps):
 
     S = torch.diag_embed(eps)
-    a2 = sample_ellipsoid(S, a1, n_explore)
+    a2 = torch.tanh(sample_ellipsoid(S, a1, n_explore))
 
     return a2
 
@@ -213,32 +215,48 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
         # Bellman backup for Q functions
         with torch.no_grad():
 
-            _, _ = ac.pi(o)
+            a1, _ = ac.pi(o)
 
-            a1 = ac.pi.sample(None)
-            std = torch.exp(ac.pi.distribution.logscale)
+            std = ac.pi.distribution.scale
             std = torch.clamp_max(std, max=eps)
 
             a2 = explore(a1, n_explore, std)
 
-            q1_dither = ac.q1(o, a2)
-            q2_dither = ac.q2(o, a2)
+            a2 = a2.reshape(n_explore * len(o), act_dim)
+            o_expand = repeat_and_reshape(o, n_explore)
 
-            q_dither = (q1_dither + q2_dither) / 2
+            # q_dither = ac.q1(o_expand, a2)
+            # q_anchor = ac.q1(o, a1)
+
+            q1_dither = ac.q1(o_expand, a2)
+            q2_dither = ac.q2(o_expand, a2)
+
+            q_dither = torch.min(q1_dither, q2_dither)
 
             q1_anchor = ac.q1(o, a1)
             q2_anchor = ac.q2(o, a1)
 
-            q_anchor = (q1_anchor + q2_anchor) / 2
+            q_anchor = torch.min(q1_anchor, q2_anchor)
+
+            q_anchor = repeat_and_reshape(q_anchor, n_explore).squeeze(-1)
 
         geps = ac.geps(o, a1)
-        geps = (geps * (a2 - a1)).sum(-1)
+        geps = repeat_and_reshape(geps, n_explore)
+        a1 = repeat_and_reshape(a1, n_explore)
 
+        # geps = (geps * (a2 - a1)).sum(-1)
+        # # mse loss against Bellman backup
+        # loss_g = F.smooth_l1_loss(geps, (q_dither - q_anchor), reduction='mean') * n_explore / eps / act_dim
+
+        delta = torch.norm(a2 - a1, dim=-1)
+        n = (a2 - a1) / delta.unsqueeze(1)
+        target = torch.clamp((q_dither - q_anchor) / delta, min=-100, max=100)
+        geps = (geps * n).sum(-1)
         # mse loss against Bellman backup
-        loss_g = F.mse_loss(geps, (q_dither - q_anchor))
+        loss_g = F.smooth_l1_loss(geps, target, reduction='mean')
 
         # Useful info for logging
-        g_info = dict(GVals=geps.flatten().detach().cpu().numpy())
+        g_info = dict(GVals=geps.flatten().detach().cpu().numpy(), GEps=std.flatten().detach().cpu().numpy())
 
         return loss_g, g_info
 
@@ -325,7 +343,9 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
                        GradGAmp=torch.norm(geps_pi, dim=-1).detach().cpu().numpy(),
                        GradQAmp=torch.norm(grad_q, dim=-1).detach().cpu().numpy(),
                        GradDelta=torch.norm(geps_pi - grad_q, dim=-1).detach().cpu().numpy(),
-                       GradSim=F.cosine_similarity(geps_pi, grad_q, dim=-1).detach().cpu().numpy(),)
+                       GradSim=F.cosine_similarity(geps_pi, grad_q, dim=-1).detach().cpu().numpy(),
+                       ActionsNorm=torch.norm(pi, dim=-1).detach().cpu().numpy(),
+                       ActionsAbs=torch.abs(pi).flatten().detach().cpu().numpy(),)
 
         return loss_pi, pi_info
 
@@ -495,6 +515,9 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
             logger.log_tabular('GradQAmp', with_min_and_max=True)
             logger.log_tabular('GradDelta', with_min_and_max=True)
             logger.log_tabular('GradSim', with_min_and_max=True)
+            logger.log_tabular('GEps', with_min_and_max=True)
+            logger.log_tabular('ActionsNorm', with_min_and_max=True)
+            logger.log_tabular('ActionsAbs', with_min_and_max=True)
 
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()

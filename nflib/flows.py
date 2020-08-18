@@ -39,6 +39,125 @@ import torch.nn.functional as F
 from torch import nn
 
 from nflib.nets import LeafParam, MLP, ARMLP
+from torch.distributions.utils import _standard_normal, broadcast_all
+from torch.distributions.exp_family import ExponentialFamily
+from numbers import Number
+from torch.distributions import constraints
+
+import math
+
+
+class MyNormal(ExponentialFamily):
+
+    arg_constraints = {'loc': constraints.real, 'logscale': constraints.real}
+    support = constraints.real
+    has_rsample = True
+    _mean_carrier_measure = 0
+
+    @property
+    def mean(self):
+        return self.loc
+
+    @property
+    def stddev(self):
+        return self.scale
+
+    @property
+    def variance(self):
+        return self.scale.pow(2)
+
+    def __init__(self, loc, logscale, validate_args=None):
+
+        self.loc, self.logscale = broadcast_all(loc, logscale)
+
+        if isinstance(loc, Number) and isinstance(logscale, Number):
+            batch_shape = torch.Size()
+        else:
+            batch_shape = self.loc.size()
+        super(MyNormal, self).__init__(batch_shape, validate_args=validate_args)
+
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(MyNormal, _instance)
+        batch_shape = torch.Size(batch_shape)
+        new.loc = self.loc.expand(batch_shape)
+        new.logscale = self.logscale.expand(batch_shape)
+        super(MyNormal, new).__init__(batch_shape, validate_args=False)
+        new._validate_args = self._validate_args
+        return new
+
+    @property
+    def scale(self):
+        return self.logscale.exp()
+
+    def sample(self, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        with torch.no_grad():
+            return torch.normal(self.loc.expand(shape), self.scale.expand(shape))
+
+    def rsample(self, sample_shape=torch.Size()):
+        shape = self._extended_shape(sample_shape)
+        eps = _standard_normal(shape, dtype=self.loc.dtype, device=self.loc.device)
+        return self.loc + eps * self.scale
+
+    def log_prob(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        return -((value - self.loc) ** 2) / (2 * self.variance) - self.logscale - math.log(math.sqrt(2 * math.pi))
+
+    def cdf(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        return 0.5 * (1 + torch.erf((value - self.loc) * self.scale.reciprocal() / math.sqrt(2)))
+
+    def icdf(self, value):
+        if self._validate_args:
+            self._validate_sample(value)
+        return self.loc + self.scale * torch.erfinv(2 * value - 1) * math.sqrt(2)
+
+    def entropy(self):
+        raise NotImplementedError
+
+    @property
+    def _natural_params(self):
+        return (self.loc / self.scale.pow(2), -0.5 * self.scale.pow(2).reciprocal())
+
+    def _log_normalizer(self, x, y):
+        return -0.25 * x.pow(2) / y + 0.5 * torch.log(-math.pi / y)
+
+
+class AutoEncoderFlow(nn.Module):
+
+    def __init__(self, nin, nout, nh, w=1e-3):
+        super().__init__()
+        self.enc = MLP(nin, nout, nh)
+        self.dec = MLP(nout, nin, nh)
+        self.w = w
+
+    def forward(self, x, recursion=True):
+
+        z = self.enc(x)
+
+        if recursion:
+            x_hat, _ = self.backward(z, recursion=False)
+            mse = torch.square(x_hat - x.detach()).sum(dim=1) + self.w * torch.square(z).sum(dim=1)
+        else:
+            mse = torch.zeros(len(x), device=x.device)
+
+        return z.detach(), -mse
+
+    def backward(self, z, recursion=True):
+
+        x = self.dec(z)
+
+        if recursion:
+
+            z_hat, _ = self.forward(x, recursion=False)
+            mse = torch.square(z_hat - z.detach()).sum(dim=1)
+        else:
+            mse = torch.zeros(len(z), device=z.device)
+
+        return x, -mse
+
 
 class AffineConstantFlow(nn.Module):
     """ 
@@ -50,14 +169,14 @@ class AffineConstantFlow(nn.Module):
         self.s = nn.Parameter(torch.randn(1, dim, requires_grad=True)) if scale else None
         self.t = nn.Parameter(torch.randn(1, dim, requires_grad=True)) if shift else None
         
-    def forward(self, x):
+    def forward(self, x, c=None):
         s = self.s if self.s is not None else x.new_zeros(x.size())
         t = self.t if self.t is not None else x.new_zeros(x.size())
         z = x * torch.exp(s) + t
         log_det = torch.sum(s, dim=1)
         return z, log_det
     
-    def backward(self, z):
+    def backward(self, z, c=None):
         s = self.s if self.s is not None else z.new_zeros(z.size())
         t = self.t if self.t is not None else z.new_zeros(z.size())
         x = (z - t) * torch.exp(-s)
@@ -75,7 +194,7 @@ class ActNorm(AffineConstantFlow):
         super().__init__(*args, **kwargs)
         self.data_dep_init_done = False
     
-    def forward(self, x):
+    def forward(self, x, c=None):
         # first batch is used for init
         if not self.data_dep_init_done:
             assert self.s is not None and self.t is not None # for now
@@ -104,7 +223,7 @@ class AffineHalfFlow(nn.Module):
         if shift:
             self.t_cond = net_class(self.dim // 2, self.dim // 2, nh)
         
-    def forward(self, x):
+    def forward(self, x, c=None):
         x0, x1 = x[:,::2], x[:,1::2]
         if self.parity:
             x0, x1 = x1, x0
@@ -118,7 +237,7 @@ class AffineHalfFlow(nn.Module):
         log_det = torch.sum(s, dim=1)
         return z, log_det
     
-    def backward(self, z):
+    def backward(self, z, c=None):
         z0, z1 = z[:,::2], z[:,1::2]
         if self.parity:
             z0, z1 = z1, z0
@@ -146,7 +265,7 @@ class SlowMAF(nn.Module):
             self.layers[str(i)] = net_class(i, 2, nh)
         self.order = list(range(dim)) if parity else list(range(dim))[::-1]
         
-    def forward(self, x):
+    def forward(self, x, c=None):
         z = torch.zeros_like(x)
         log_det = torch.zeros(x.size(0))
         for i in range(self.dim):
@@ -156,7 +275,7 @@ class SlowMAF(nn.Module):
             log_det += s
         return z, log_det
 
-    def backward(self, z):
+    def backward(self, z, c=None):
         x = torch.zeros_like(z)
         log_det = torch.zeros(z.size(0))
         for i in range(self.dim):
@@ -175,7 +294,7 @@ class MAF(nn.Module):
         self.net = net_class(dim, dim*2, nh)
         self.parity = parity
 
-    def forward(self, x):
+    def forward(self, x, c=None):
         # here we see that we are evaluating all of z in parallel, so density estimation will be fast
         st = self.net(x)
         s, t = st.split(self.dim, dim=1)
@@ -185,7 +304,7 @@ class MAF(nn.Module):
         log_det = torch.sum(s, dim=1)
         return z, log_det
     
-    def backward(self, z):
+    def backward(self, z, c=None):
         # we have to decode the x one at a time, sequentially
         x = torch.zeros_like(z)
         log_det = torch.zeros(z.size(0))
@@ -211,36 +330,38 @@ class Invertible1x1Conv(nn.Module):
     """ 
     As introduced in Glow paper.
     """
-    
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         Q = torch.nn.init.orthogonal_(torch.randn(dim, dim))
         P, L, U = torch.lu_unpack(*Q.lu())
-        self.P = P # remains fixed during optimization
-        self.L = nn.Parameter(L) # lower triangular portion
-        self.S = nn.Parameter(U.diag()) # "crop out" the diagonal to its own parameter
-        self.U = nn.Parameter(torch.triu(U, diagonal=1)) # "crop out" diagonal, stored in S
+        # remains fixed during optimization
+        self.register_buffer('P', P)
+        self.L = nn.Parameter(L)  # lower triangular portion
+        self.S = nn.Parameter(U.diag())  # "crop out" the diagonal to its own parameter
+        self.U = nn.Parameter(torch.triu(U, diagonal=1))  # "crop out" diagonal, stored in S
 
     def _assemble_W(self):
         """ assemble W from its pieces (P, L, U, S) """
-        L = torch.tril(self.L, diagonal=-1) + torch.diag(torch.ones(self.dim))
+        L = torch.tril(self.L, diagonal=-1) + torch.diag(torch.ones(self.dim, device=self.L.device))
         U = torch.triu(self.U, diagonal=1)
         W = self.P @ L @ (U + torch.diag(self.S))
         return W
 
-    def forward(self, x):
+    def forward(self, x, c=None):
         W = self._assemble_W()
         z = x @ W
         log_det = torch.sum(torch.log(torch.abs(self.S)))
         return z, log_det
 
-    def backward(self, z):
+    def backward(self, z, c=None):
         W = self._assemble_W()
         W_inv = torch.inverse(W)
         x = z @ W_inv
         log_det = -torch.sum(torch.log(torch.abs(self.S)))
         return x, log_det
+
 
 # ------------------------------------------------------------------------
 
@@ -253,7 +374,7 @@ class NormalizingFlow(nn.Module):
 
     def forward(self, x):
         m, _ = x.shape
-        log_det = torch.zeros(m)
+        log_det = torch.zeros(m, device=x.device)
         zs = [x]
         for flow in self.flows:
             x, ld = flow.forward(x)
@@ -263,7 +384,7 @@ class NormalizingFlow(nn.Module):
 
     def backward(self, z):
         m, _ = z.shape
-        log_det = torch.zeros(m)
+        log_det = torch.zeros(m, device=z.device)
         xs = [z]
         for flow in self.flows[::-1]:
             z, ld = flow.backward(z)
@@ -271,14 +392,15 @@ class NormalizingFlow(nn.Module):
             xs.append(z)
         return xs, log_det
 
+
 class NormalizingFlowModel(nn.Module):
     """ A Normalizing Flow Model is a (prior, flow) pair """
-    
+
     def __init__(self, prior, flows):
         super().__init__()
         self.prior = prior
         self.flow = NormalizingFlow(flows)
-    
+
     def forward(self, x):
         zs, log_det = self.flow.forward(x)
         prior_logprob = self.prior.log_prob(zs[-1]).view(x.size(0), -1).sum(1)
@@ -287,8 +409,107 @@ class NormalizingFlowModel(nn.Module):
     def backward(self, z):
         xs, log_det = self.flow.backward(z)
         return xs, log_det
-    
+
     def sample(self, num_samples):
         z = self.prior.sample((num_samples,))
         xs, _ = self.flow.backward(z)
         return xs
+
+
+class ConditionalNormalizingFlow(nn.Module):
+    """ A sequence of Normalizing Flows is a Normalizing Flow """
+
+    def __init__(self, flows):
+        super().__init__()
+        self.flows = nn.ModuleList(flows)
+
+    def forward(self, x, c=None):
+        m, _ = x.shape
+        log_det = torch.zeros(m, device=x.device)
+        zs = [x]
+        for flow in self.flows:
+            x, ld = flow.forward(x, c)
+            log_det += ld
+            zs.append(x)
+        return zs, log_det
+
+    def backward(self, z, c=None):
+        m, _ = z.shape
+        log_det = torch.zeros(m, device=z.device)
+        xs = [z]
+        for flow in self.flows[::-1]:
+            z, ld = flow.backward(z, c)
+            log_det += ld
+            xs.append(z)
+        return xs, log_det
+
+
+class ConditionalNormalizingFlowModel(nn.Module):
+    """ A Normalizing Flow Model is a (prior, flow) pair """
+
+    def __init__(self, flows, x_dim, c_dim, nh):
+        super().__init__()
+        self.flow = ConditionalNormalizingFlow(flows)
+        self.context_mlp = MLP(c_dim, nh, nh)
+        self.loc = nn.Sequential(nn.ReLU(),
+                                nn.Linear(nh, x_dim))
+        self.logscale = nn.Sequential(nn.ReLU(),
+                                nn.Linear(nh, x_dim))
+        self.context = nn.Sequential(nn.ReLU(),
+                                nn.Linear(nh, c_dim))
+
+        self.c = None
+        self.prior = None
+
+    def forward(self, x, c):
+
+        c = self.context_mlp(c)
+        loc = self.loc(c)
+        logscale = self.logscale(c)
+        self.c = c = self.context(c)
+
+        params = {'loc': loc, 'logscale': logscale}
+        self.prior = MyNormal(**params)
+
+        zs, log_det = self.flow.forward(x, c)
+        prior_logprob = self.prior.log_prob(zs[-1]).view(x.size(0), -1).sum(1)
+        return zs, prior_logprob, log_det
+
+    def backward(self, z, c):
+
+        c = self.context_mlp(c)
+        loc = self.loc(c)
+        logscale = self.logscale(c)
+        c = self.context(c)
+
+        params = {'loc': loc, 'logscale': logscale}
+        self.prior = MyNormal(**params)
+
+        xs, log_det = self.flow.backward(z, c)
+        return xs, log_det
+
+    def sample(self, c=None, num_samples=1):
+
+        if c is not None:
+            c = self.context_mlp(c)
+            loc = self.loc(c)
+            logscale = self.logscale(c)
+            c = self.context(c)
+
+            params = {'loc': loc, 'logscale': logscale}
+            prior = MyNormal(**params)
+
+        else:
+            prior = self.prior
+            c = self.c
+
+        z = prior.sample((num_samples,))
+        _, b, _ = z.shape
+
+        z = z.view(num_samples * b, -1)
+
+        xs, _ = self.flow.backward(z, c)
+        xs = xs[-1].view(num_samples, b, -1).squeeze(0)
+
+        return xs
+

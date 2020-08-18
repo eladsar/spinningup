@@ -14,7 +14,11 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
+debug_a1 = None
+debug_a2 = None
+
+
+def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0, min_dist=1e-2):
     bz, nz, _ = S.shape
     z_hat = z_hat.view(bz, nz, 1)
 
@@ -26,10 +30,10 @@ def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
 
     X_Cnz = X_Cnz / kron_prod  # Points uniformly distributed on hypersphere surface
 
-    # R = torch.ones(bz, nz, 1, device=z_hat.device) * (
+    # R = min_dist + (1 - min_dist) * torch.ones(bz, nz, 1, device=z_hat.device) * (
     #     torch.pow(torch.rand(bz, 1, m_FA, device=z_hat.device), (1. / nz)))
 
-    R = torch.ones(bz, nz, 1, device=z_hat.device) * (torch.rand(bz, 1, m_FA, device=z_hat.device))
+    R = min_dist + (1 - min_dist) * torch.ones(bz, nz, 1, device=z_hat.device) * (torch.rand(bz, 1, m_FA, device=z_hat.device))
 
     unif_sph = R * X_Cnz  # m_FA points within the hypersphere
     T = torch.cholesky(S)  # Cholesky factorization of S => S=T’T
@@ -44,8 +48,20 @@ def sample_ellipsoid(S, z_hat, m_FA, Gamma_Threshold=1.0):
 
 def explore(a1, n_explore, eps):
 
-    S = torch.diag_embed(eps)
-    a2 = torch.tanh(sample_ellipsoid(S, a1, n_explore))
+    global debug_a1, debug_a2
+
+    debug_a1 = a1.data.clone()
+    a1 = core.atanh(a1)
+
+    S = torch.diag_embed(eps) ** 2
+    a2_org = sample_ellipsoid(S, a1, n_explore)
+
+    a2 = torch.tanh(a2_org)
+
+    debug_a2 = a2_org.data.clone()
+
+    # if ((a1_org - a2) == 0).all(dim=1).any():
+    #     print("xxx")
 
     return a2
 
@@ -244,19 +260,22 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
         geps = repeat_and_reshape(geps, n_explore)
         a1 = repeat_and_reshape(a1, n_explore)
 
-        # geps = (geps * (a2 - a1)).sum(-1)
-        # # mse loss against Bellman backup
-        # loss_g = F.smooth_l1_loss(geps, (q_dither - q_anchor), reduction='mean') * n_explore / eps / act_dim
-
-        delta = torch.norm(a2 - a1, dim=-1)
-        n = (a2 - a1) / delta.unsqueeze(1)
-        target = torch.clamp((q_dither - q_anchor) / delta, min=-100, max=100)
-        geps = (geps * n).sum(-1)
+        geps = (geps * (a2 - a1)).sum(-1)
         # mse loss against Bellman backup
-        loss_g = F.smooth_l1_loss(geps, target, reduction='mean')
+        loss_g = F.smooth_l1_loss(geps, (q_dither - q_anchor), reduction='mean') * n_explore / eps / act_dim
+
+        # delta = torch.norm(a2 - a1, dim=-1)
+        # n = (a2 - a1) / delta.unsqueeze(1)
+        # target = torch.clamp((q_dither - q_anchor) / delta, min=-100, max=100)
+        # geps = (geps * n).sum(-1)
+        # # mse loss against Bellman backup
+        # loss_g = F.smooth_l1_loss(geps, target, reduction='mean')
 
         # Useful info for logging
         g_info = dict(GVals=geps.flatten().detach().cpu().numpy(), GEps=std.flatten().detach().cpu().numpy())
+
+        # return loss_g, g_info, {'delta': delta, 'n': n, 'a1': a1, 'a2': a2, 'target': target,
+        #                         'geps': geps, 'q_dither': q_dither, 'q_anchor': q_anchor}
 
         return loss_g, g_info
 
@@ -325,7 +344,9 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
     def compute_loss_pi(data):
         o = data['obs']
         pi, logp_pi = ac.pi(o)
-        geps_pi = ac.geps(o, pi)
+
+        with torch.no_grad():
+            geps_pi = ac.geps(o, pi)
 
         # Entropy-regularized policy loss
         loss_pi = (alpha * logp_pi - (geps_pi * pi).sum(-1)).mean()
@@ -371,6 +392,10 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
         q_optimizer.zero_grad()
         loss_q, q_info = compute_loss_q(data)
         loss_q.backward()
+
+        # if any([torch.isnan(p.grad).any() for p in ac.parameters() if p.grad is not None]):
+        #     print('nan')
+
         q_optimizer.step()
 
         # Record things
@@ -378,8 +403,14 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
 
         # Next run one gradient descent step for the mean-gradient
         g_optimizer.zero_grad()
+        # loss_g, g_info, g_dict = compute_loss_g(data)
         loss_g, g_info = compute_loss_g(data)
         loss_g.backward()
+
+        # if any([torch.isnan(p.grad).any() for p in ac.parameters() if p.grad is not None]):
+        #     # print('nan')
+        #     print(len(g_dict))
+
         g_optimizer.step()
 
         # Record things
@@ -394,6 +425,10 @@ def gegl(env_fn, ac_kwargs=dict(), seed=0,
         pi_optimizer.zero_grad()
         loss_pi, pi_info = compute_loss_pi(data)
         loss_pi.backward()
+
+        # if any([torch.isnan(p.grad).any() for p in ac.parameters() if p.grad is not None]):
+        #     print('nan')
+
         pi_optimizer.step()
 
         # Unfreeze Q-networks so you can optimize it at next DDPG step.

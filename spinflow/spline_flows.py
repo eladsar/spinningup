@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 
-from nflib.nets import MLP
+from spinflow.nets import MLP
 
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
@@ -19,10 +19,7 @@ DEFAULT_MIN_DERIVATIVE = 1e-3
 
 def searchsorted(bin_locations, inputs, eps=1e-6):
     bin_locations[..., -1] += eps
-    return torch.sum(
-        inputs[..., None] >= bin_locations,
-        dim=-1
-    ) - 1
+    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
 
 def unconstrained_RQS(inputs, unnormalized_widths, unnormalized_heights,
                       unnormalized_derivatives, inverse=False,

@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import math
+from spinflow.nets import MLP
 
 
 def init_weights(net, init='ortho'):
@@ -43,6 +44,40 @@ class FCNet(nn.Module):
         return x
 
 
+class RunningNorm(nn.Module):
+
+    def __init__(self, shape, momentum=0.01, eps=1e-5):
+        super(RunningNorm, self).__init__()
+
+        if type(shape) is int:
+            shape = (shape, )
+
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer('running_mean', torch.zeros(1, *shape))
+        self.register_buffer('running_var', torch.ones(1, *shape))
+        self.weight = nn.Parameter(torch.Tensor(1, *shape))
+        self.bias = nn.Parameter(torch.Tensor(1, *shape))
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+
+        if self.training:
+
+            with torch.no_grad():
+                mean = x.mean(dim=0, keepdim=True)
+                var = x.var(dim=0, keepdim=True)
+                self.running_mean = self.running_mean * (1 - self.momentum) + self.momentum * mean
+                self.running_var = self.running_var * (1 - self.momentum) + self.momentum * var
+
+        mean = self.running_mean
+
+        std = torch.sqrt(self.running_var) + self.eps
+
+        return (x - mean) / std * self.weight + self.bias
+
+
 class SplineEmbedding(nn.Module):
 
     def __init__(self, actions, emb, delta):
@@ -55,7 +90,9 @@ class SplineEmbedding(nn.Module):
 
         self.register_buffer('ind_offset', torch.arange(self.actions, dtype=torch.int64).unsqueeze(0))
         self.b = nn.Embedding((2 * self.delta + 1) * actions, emb, sparse=True)
-        self.norm = nn.BatchNorm1d(self.actions, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+
+        self.norm = RunningNorm(self.actions, eps=1e-05, momentum=0.1)
+        # self.norm = nn.BatchNorm1d(self.actions, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
 
     def forward(self, x):
 
@@ -225,13 +262,13 @@ class SplineHead(nn.Module):
 
 class SplineNet(nn.Module):
 
-    def __init__(self, actions, emb=8, layer=64, delta=10, n=1):
+    def __init__(self, actions, emb=8, layer=64, delta=10, n=1, n_res=1):
 
         super(SplineNet, self).__init__()
 
         emb2 = int(layer / actions + .5)
         self.embedding = SplineEmbedding(actions, emb, delta)
-        self.head = SplineHead(actions, emb, emb2, layer, n=n)
+        self.head = SplineHead(actions, emb, emb2, layer, n=n, n_res=n_res)
 
     def forward(self, x):
 
@@ -258,11 +295,11 @@ class MLP2Layers(nn.Module):
 
 class SplineAutoEncoder(nn.Module):
 
-    def __init__(self, actions, emb=8, layer=64, delta=10, nh=128):
+    def __init__(self, actions, emb=8, layer=64, delta=10, nh=128, n_res=1):
         super().__init__()
 
-        self.encoder = SplineNet(actions, emb=emb, layer=layer, delta=delta, n=nh)
-        self.decoder = MLP2Layers(nin=nh, nout=actions, nh=2 * layer)
+        self.encoder = SplineNet(actions, emb=emb, layer=layer, delta=delta, n=nh, n_res=n_res)
+        self.decoder = MLP(nin=nh, nout=actions, nh=2 * layer, leak=0)
 
     def forward(self, x):
         z = self.encoder(x)

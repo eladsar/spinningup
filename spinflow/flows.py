@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nflib.nets import LeafParam, MLP, ARMLP
+from spinflow.nets import LeafParam, MLP, ARMLP
 from torch.distributions.utils import _standard_normal, broadcast_all
 from torch.distributions.exp_family import ExponentialFamily
 from numbers import Number
@@ -193,12 +193,13 @@ class ActNorm(AffineConstantFlow):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.data_dep_init_done = False
-    
+        self.eps = 1e-3
+
     def forward(self, x, c=None):
         # first batch is used for init
         if not self.data_dep_init_done:
             assert self.s is not None and self.t is not None # for now
-            self.s.data = (-torch.log(x.std(dim=0, keepdim=True))).detach()
+            self.s.data = (-torch.log(torch.clamp_min(x.std(dim=0, keepdim=True), min=self.eps))).detach()
             self.t.data = (-(x * torch.exp(self.s)).mean(dim=0, keepdim=True)).detach()
             self.data_dep_init_done = True
         return super().forward(x)

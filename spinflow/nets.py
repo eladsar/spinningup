@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from nflib.made import MADE
+from spinflow.made import MADE
 
 class LeafParam(nn.Module):
     """ 
@@ -39,15 +39,15 @@ class PositionalEncoder(nn.Module):
 class MLP(nn.Module):
     """ a simple 4-layer MLP """
 
-    def __init__(self, nin, nout, nh):
+    def __init__(self, nin, nout, nh, leak=0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(nin, nh),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(leak),
             nn.Linear(nh, nh),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(leak),
             nn.Linear(nh, nh),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(leak),
             nn.Linear(nh, nout),
         )
     def forward(self, x):

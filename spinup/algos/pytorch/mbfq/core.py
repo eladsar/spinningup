@@ -12,15 +12,15 @@ from torch.distributions import constraints
 import torch.autograd as autograd
 import itertools
 import math
-from nflib.flows import AutoEncoderFlow, ConditionalNormalizingFlowModel
-from nflib.flows import (
+from spinflow.flows import AutoEncoderFlow, ConditionalNormalizingFlowModel
+from spinflow.flows import (
     AffineConstantFlow, ActNorm, AffineHalfFlow,
     SlowMAF, MAF, IAF, Invertible1x1Conv,
     NormalizingFlow, NormalizingFlowModel,
 )
-from nflib.spline_flows import NSF_AR, NSF_CL
-from .spline_model import SplineAutoEncoder, MLP2Layers
-from nflib.nets import MLP
+from spinflow.spline_flows import NSF_AR, NSF_CL
+from .spline_model import SplineAutoEncoder, MLP2Layers, SplineNet
+from spinflow.nets import MLP
 import torch.autograd as autograd
 
 def combined_shape(length, shape=None):
@@ -43,17 +43,131 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 
 
-class WorldModel(nn.Module):
+class MLPAutoEncoder(nn.Module):
+
+    def __init__(self, actions, nh=128):
+        super().__init__()
+
+        self.encoder = MLP(nin=actions, nout=nh, nh=128)
+        self.decoder = MLP(nin=nh, nout=actions, nh=128)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        xhat = self.decoder(z)
+
+        return z, xhat
+
+
+class DeterministicWorldModel(nn.Module):
 
     def __init__(self, obs_dim, state_dim, act_dim):
         super().__init__()
 
+        self.ae = SplineAutoEncoder(obs_dim, nh=state_dim, n_res=2, emb=16)
+
+        # self.r = SplineNet(state_dim + act_dim, n=1)
+        # self.d = SplineNet(state_dim + act_dim, n=1)
+        # self.stag = SplineNet(state_dim + act_dim, n=state_dim)
+
+        # self.r = MLP2Layers(state_dim + act_dim, 1, 128)
+        # self.d = MLP2Layers(state_dim + act_dim, 1, 128)
+        # self.stag = MLP2Layers(state_dim + act_dim, state_dim, 128)
+
+        self.r = MLP(state_dim + act_dim, 1, 128, leak=0)
+        self.d = MLP(state_dim + act_dim, 1, 128, leak=0)
+        self.stag = MLP(state_dim + act_dim, state_dim, 128, leak=0)
+
+    def forward(self, o, a, r, o2, d):
+
+        with torch.no_grad():
+            s2, o2hat = self.ae(o2)
+
+        s, ohat = self.ae(o)
+
+        c = torch.cat([s, a], dim=1)
+        rhat = self.r(c).squeeze(-1)
+        dhat = self.d(c).squeeze(-1)
+        s2hat = self.stag(c).squeeze(-1)
+
+        loss_r = F.smooth_l1_loss(rhat, r, reduction='sum')
+        loss_stag = F.smooth_l1_loss(s2hat, s2, reduction='none').sum(dim=1).mean()
+        loss_d = F.binary_cross_entropy_with_logits(dhat, d, reduction='mean')
+
+        reg = torch.square(s).mean(dim=0)
+        reg = (reg - torch.log(reg)).sum(dim=-1)
+
+        rec = torch.square(o - ohat).sum(dim=-1).mean()
+
+        loss = 0.01 * (reg - 1) + rec + loss_r + loss_d + loss_stag
+
+        aux = dict(loss=float(loss), reg=float(reg), rec=float(rec), loss_stag=float(loss_stag),
+                   loss_d=float(loss_d), loss_r=float(loss_r))
+
+        return loss, aux
+
+    def get_state(self, o, batch_size=None):
+
+        if len(o) == 1:
+            self.ae.eval()
+            o0 = o.squeeze(0)
+
+            if hasattr(self.ae.encoder, 'embedding'):
+                # try batch correction
+                running_mean = self.ae.encoder.embedding.norm.running_mean
+                running_var = self.ae.encoder.embedding.norm.running_var
+
+                self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
+                self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
+
+        with torch.no_grad():
+            s, _ = self.ae(o)
+
+        if len(o) == 1:
+            self.ae.train()
+            if hasattr(self.ae.encoder, 'embedding'):
+                self.ae.encoder.embedding.norm.running_mean = running_mean
+                self.ae.encoder.embedding.norm.running_var = running_var
+
+        return s
+
+    def gen(self, o, a):
+
+        # only for learning (dont use with a single state)
+        with torch.no_grad():
+            s, _ = self.ae(o)
+            c = torch.cat([s, a], dim=1)
+            s2 = self.stag(c)
+            r = self.r(c)
+            d = torch.bernoulli(torch.sigmoid(self.d(c)))
+
+        return s, s2, r, d
+
+    def grad_q(self, c, gamma, v_net):
+
+        s2 = self.stag(c)
+        v2 = v_net(s2)
+        d = torch.sigmoid(self.d(c))
+        rhat = self.r(c)
+
+        qa = (rhat + gamma * v2 * (1 - d)).mean()
+
+        return qa
+
+
+class WorldModel(nn.Module):
+
+    def __init__(self, obs_dim, state_dim, act_dim, B=20, K=20):
+        super().__init__()
+
         # self.ae = AutoEncoderFlow(obs_dim, obs_dim // 2, 256, w=1e-3)
         self.ae = SplineAutoEncoder(obs_dim, nh=state_dim)
+        # self.ae = MLPAutoEncoder(obs_dim, nh=state_dim)
         self.r = MLP2Layers(state_dim + act_dim, 1, 64)
         self.d = MLP2Layers(state_dim + act_dim, 1, 64)
 
-        flows = [NSF_CL(dim=state_dim, K=60, B=60, hidden_dim=16, base_network=MLP, contex_dim=state_dim+act_dim) for _ in range(3)]
+        # flows = [NSF_CL(dim=state_dim, K=60, B=60, hidden_dim=16, base_network=MLP, contex_dim=state_dim+act_dim) for _ in range(1)]
+        flows = [NSF_CL(dim=state_dim, K=K, B=B, hidden_dim=16, base_network=MLP, contex_dim=state_dim + act_dim) for
+                 _ in range(1)]
         convs = [Invertible1x1Conv(dim=state_dim) for _ in flows]
         # norms = [ActNorm(dim=state_dim, eps=1e-3) for _ in flows]
         norms = [ActNorm(dim=state_dim) for _ in flows]
@@ -63,14 +177,16 @@ class WorldModel(nn.Module):
 
     def forward(self, o, a, r, o2, d):
 
+        with torch.no_grad():
+            s2, o2hat = self.ae(o2)
+
         s, ohat = self.ae(o)
-        s2, o2hat = self.ae(o2)
 
         c = torch.cat([s, a], dim=1)
         rhat = self.r(c)
         dhat = self.d(c)
 
-        _, prior_logprob, log_det = self.flow(s2, c)
+        _, prior_logprob, log_det = self.flow(s2.detach(), c.detach())
         prior_logprob = prior_logprob.mean()
         log_det = log_det.mean()
 
@@ -82,40 +198,37 @@ class WorldModel(nn.Module):
         reg = torch.square(s).mean(dim=0)
         reg = (reg - torch.log(reg)).sum(dim=-1)
 
-        reg2 = torch.square(s2).mean(dim=0)
-        reg2 = (reg2 - torch.log(reg2)).sum(dim=-1)
-
         rec = torch.square(o - ohat).sum(dim=-1).mean()
-        rec2 = torch.square(o2 - o2hat).sum(dim=-1).mean()
 
-        loss = 0.5 * (0.01 * (reg - 1) + rec + 0.01 * (reg2 - 1) + rec2) + loss_r + loss_d + s2_nll
+        loss = 0.01 * (reg - 1) + rec + loss_r + loss_d + s2_nll
 
-        aux = dict(loss=float(loss), reg=float(reg), reg2=float(reg2), prior_logprob=float(prior_logprob),
-                   log_det=float(log_det), loss_d=float(loss_d))
+        aux = dict(loss=float(loss), reg=float(reg), rec=float(rec), prior_logprob=float(prior_logprob),
+                   log_det=float(log_det), loss_d=float(loss_d), loss_r=float(loss_r))
 
         return loss, aux
 
-    def get_state(self, o, batch_size):
+    def get_state(self, o, batch_size=None):
 
         if len(o) == 1:
             self.ae.eval()
-
-            # try batch correction
-            running_mean = self.ae.encoder.embedding.norm.running_mean
-            running_var = self.ae.encoder.embedding.norm.running_var
-
             o0 = o.squeeze(0)
 
-            self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
-            self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
+            if hasattr(self.ae.encoder, 'embedding'):
+                # try batch correction
+                running_mean = self.ae.encoder.embedding.norm.running_mean
+                running_var = self.ae.encoder.embedding.norm.running_var
+
+                self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
+                self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
 
         with torch.no_grad():
             s, _ = self.ae(o)
 
         if len(o) == 1:
             self.ae.train()
-            self.ae.encoder.embedding.norm.running_mean = running_mean
-            self.ae.encoder.embedding.norm.running_var = running_var
+            if hasattr(self.ae.encoder, 'embedding'):
+                self.ae.encoder.embedding.norm.running_mean = running_mean
+                self.ae.encoder.embedding.norm.running_var = running_var
 
         return s
 
@@ -131,27 +244,19 @@ class WorldModel(nn.Module):
 
         return s, s2, r, d
 
-    def grad_q(self, o, a, gamma, v_net):
+    def grad_q(self, c, gamma, v_net):
 
         with torch.no_grad():
-            s, _ = self.ae(o)
-            c = torch.cat([s, a], dim=1)
             s2 = self.flow.sample(c)
             v2 = v_net(s2)
             d = torch.bernoulli(torch.sigmoid(self.d(c)))
-
-        a = autograd.Variable(a.detach().clone(), requires_grad=True)
-        c = torch.cat([s, a], dim=1)
 
         rhat = self.r(c)
         _, prior_logprob, log_det = self.flow(s2, c)
 
         qa = (rhat + gamma * v2 * (1 - d) * (log_det + prior_logprob)).mean()
 
-        grad_q = autograd.grad(outputs=qa, inputs=a, grad_outputs=torch.cuda.FloatTensor(qa.size()).fill_(1.),
-                               create_graph=False, retain_graph=False, only_inputs=True)[0]
-
-        return grad_q.detach()
+        return qa
 
 
 class MLPActorCritic(nn.Module):
@@ -189,8 +294,12 @@ class MyNormal(ExponentialFamily):
         return self.scale
 
     @property
+    def kl_normal(self):
+        return (self.variance + self.mean ** 2) / 2 - self.logscale - 0.5
+
+    @property
     def variance(self):
-        return self.scale.pow(2)
+        return torch.exp(self.logscale * 2)
 
     def __init__(self, loc, logscale, validate_args=None):
 

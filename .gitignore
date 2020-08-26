@@ -9,3 +9,4 @@ data/
 .vscode/
 .DS_Store
 _build/
+notebooks/.ipynb_checkpoints

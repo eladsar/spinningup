@@ -4,8 +4,8 @@ import numpy as np
 import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco;
-
 set_mujoco();
+import os
 import gym
 import time
 import spinup.algos.pytorch.mbfq.core as core
@@ -52,7 +52,7 @@ class ReplayBuffer:
 
 def mbfq(env_fn, ac_kwargs=dict(), seed=0,
          steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
-         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=10000,
+         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=128, start_steps=10000,
          update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
          logger_kwargs=dict(), save_freq=1, update_factor=1, device='cuda'):
 
@@ -70,10 +70,19 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
 
-    state_dim = {376: 144, 111: 64, 17: 12, 11: 8}[obs_dim[0]]
+    # state_dim = {376: 144, 111: 64, 17: 12, 11: 8}[obs_dim[0]]
+    state_dim = 128
     # Create actor-critic module and target networks
     ac = core.MLPActorCritic(state_dim, env.action_space, **ac_kwargs).to(device)
-    model = core.WorldModel(obs_dim[0], state_dim, act_dim).to(device)
+    # model = core.WorldModel(obs_dim[0], state_dim, act_dim).to(device)
+    model = core.DeterministicWorldModel(obs_dim[0], 128, act_dim).to(device)
+
+    # temporary hook
+    environment = 'halfcheetah'
+    root_dir = '/mnt/dsi_vol1/users/elads/data/spinningup/data'
+    log_dir = os.path.join(root_dir, f'{environment}_world_model')
+    model.load_state_dict(torch.load(os.path.join(log_dir, 'model')))
+
     ac_targ = deepcopy(ac)
 
     # Freeze target networks with respect to optimizers (only update via polyak averaging)
@@ -84,8 +93,8 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v, model.r, model.ae, model.flow])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d, \t r: %d, \t ae: %d, \t flow: %d\n' % var_counts)
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v, model.r, model.ae])
+    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d, \t r: %d, \t ae: %d\n' % var_counts)
 
     # Set up function for computing SAC Q-losses
     def compute_loss_model(data):
@@ -98,12 +107,19 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     # Set up function for computing SAC Q-losses
     def compute_loss_v(data):
 
-        o, a = data['obs'], data['act']
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        s, s2, r, d = model.gen(o, a)
+        # s, s2, r, d = model.gen(o, a)
+        #
+        # with torch.no_grad():
+        #
+        #     v2 = ac_targ.v(s2)
+        #     g_target = r + gamma * (1 - d) * v2
+        #     _, logp_pi = ac.pi(s)
 
         with torch.no_grad():
-
+            s = model.get_state(o)
+            s2 = model.get_state(o2)
             v2 = ac_targ.v(s2)
             g_target = r + gamma * (1 - d) * v2
             _, logp_pi = ac.pi(s)
@@ -120,16 +136,22 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
-        s = model.get_state(o)
+
+        with torch.no_grad():
+            s = model.get_state(o)
+
         pi, logp_pi = ac.pi(s)
+        c = torch.cat([s, pi], dim=1)
 
-        grad_q = model.grad_q(o, a, gamma, ac.v)
+        # grad_q = model.grad_q(s, pi.detach(), gamma, ac.v)
+        qa = model.grad_q(c, gamma, ac.v)
+        loss_pi = (alpha * logp_pi - qa).mean()
 
-        loss_pi = (alpha * logp_pi - (grad_q * pi).sum(-1)).mean()
+        # loss_pi = (alpha * logp_pi - (grad_q * pi).sum(-1)).mean()
 
         # Useful info for logging
         pi_info = dict(LogPi=logp_pi.detach().cpu().numpy(),
-                       GradQAmp=torch.norm(grad_q, dim=-1).detach().cpu().numpy(),
+                       # GradQAmp=torch.norm(grad_q, dim=-1).detach().cpu().numpy(),
                        ActionsNorm=torch.norm(pi, dim=-1).detach().cpu().numpy(),
                        ActionsAbs=torch.abs(pi).flatten().detach().cpu().numpy(), )
 
@@ -137,6 +159,7 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
     v_optimizer = Adam(ac.v.parameters(), lr=lr)
+    # model_optimizer = Adam(model.parameters(), lr=lr)
     model_optimizer = SparseDenseAdamOptimizer(model, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
 
     # Set up model saving
@@ -145,29 +168,26 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     def update(data):
 
         # First run one gradient descent step for the world-model
-        model_optimizer.zero_grad()
-        loss_model, model_info = compute_loss_model(data)
-        loss_model.backward()
-        model_optimizer.step()
-
-        # Record things
-        logger.store(LossG=loss_model.item(), **model_info)
+        # loss_model, model_info = compute_loss_model(data)
+        # model_optimizer.zero_grad()
+        # loss_model.backward()
+        # model_optimizer.step()
+        # # Record things
+        # logger.store(LossModel=loss_model.item(), **model_info)
 
         # next run one gradient descent step for the world-model
-        v_optimizer.zero_grad()
         loss_v, v_info = compute_loss_v(data)
+        v_optimizer.zero_grad()
         loss_v.backward()
         v_optimizer.step()
-
         # Record things
-        logger.store(LossQ=loss_v.item(), **v_info)
+        logger.store(LossV=loss_v.item(), **v_info)
 
         # Next run one gradient descent step for pi.
-        pi_optimizer.zero_grad()
         loss_pi, pi_info = compute_loss_pi(data)
+        pi_optimizer.zero_grad()
         loss_pi.backward()
         pi_optimizer.step()
-
         # Record things
         logger.store(LossPi=loss_pi.item(), **pi_info)
 
@@ -181,8 +201,8 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     def get_action(o, deterministic=False):
 
-        s = model.get_state(o)
-        return ac.act(torch.as_tensor(s, dtype=torch.float32, device=device), deterministic)
+        s = model.get_state(torch.as_tensor(o, dtype=torch.float32, device=device).unsqueeze(0), batch_size=batch_size).squeeze(0)
+        return ac.act(s, deterministic)
 
     def test_agent():
         for j in range(num_test_episodes):
@@ -257,13 +277,12 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
+            logger.log_tabular('VVals', with_min_and_max=True)
             logger.log_tabular('LogPi', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossQ', average_only=True)
-            logger.log_tabular('GradGAmp', with_min_and_max=True)
-            logger.log_tabular('GradQAmp', with_min_and_max=True)
+            logger.log_tabular('LossV', average_only=True)
+            # logger.log_tabular('LossModel', average_only=True)
+            # logger.log_tabular('GradQAmp', with_min_and_max=True)
             logger.log_tabular('ActionsNorm', with_min_and_max=True)
             logger.log_tabular('ActionsAbs', with_min_and_max=True)
 
@@ -282,8 +301,7 @@ if __name__ == '__main__':
     parser.add_argument('--eps', type=float, default=0.4)
     parser.add_argument('--seed', '-s', type=int, default=0)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--n_explore', type=int, default=32)
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--exp_name', type=str, default='egl')
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()

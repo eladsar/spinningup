@@ -57,220 +57,247 @@ class MLPAutoEncoder(nn.Module):
 
         return z, xhat
 
+#
+# class DeterministicWorldModel(nn.Module):
+#
+#     def __init__(self, obs_dim, state_dim, act_dim):
+#         super().__init__()
+#
+#         self.ae = SplineAutoEncoder(obs_dim, nh=state_dim, n_res=2, emb=16)
+#
+#         # self.r = SplineNet(state_dim + act_dim, n=1)
+#         # self.d = SplineNet(state_dim + act_dim, n=1)
+#         # self.stag = SplineNet(state_dim + act_dim, n=state_dim)
+#
+#         # self.r = MLP2Layers(state_dim + act_dim, 1, 128)
+#         # self.d = MLP2Layers(state_dim + act_dim, 1, 128)
+#         # self.stag = MLP2Layers(state_dim + act_dim, state_dim, 128)
+#
+#         self.r = MLP(state_dim + act_dim, 1, 128, leak=0)
+#         self.d = MLP(state_dim + act_dim, 1, 128, leak=0)
+#         self.stag = MLP(state_dim + act_dim, state_dim, 128, leak=0)
+#
+#     def forward(self, o, a, r, o2, d):
+#
+#         with torch.no_grad():
+#             s2, o2hat = self.ae(o2)
+#
+#         s, ohat = self.ae(o)
+#
+#         c = torch.cat([s, a], dim=1)
+#         rhat = self.r(c).squeeze(-1)
+#         dhat = self.d(c).squeeze(-1)
+#         s2hat = self.stag(c).squeeze(-1)
+#
+#         loss_r = F.smooth_l1_loss(rhat, r, reduction='sum')
+#         loss_stag = F.smooth_l1_loss(s2hat, s2, reduction='none').sum(dim=1).mean()
+#         loss_d = F.binary_cross_entropy_with_logits(dhat, d, reduction='mean')
+#
+#         reg = torch.square(s).mean(dim=0)
+#         reg = (reg - torch.log(reg)).sum(dim=-1)
+#
+#         rec = torch.square(o - ohat).sum(dim=-1).mean()
+#
+#         loss = 0.01 * (reg - 1) + rec + loss_r + loss_d + loss_stag
+#
+#         aux = dict(loss=float(loss), reg=float(reg), rec=float(rec), loss_stag=float(loss_stag),
+#                    loss_d=float(loss_d), loss_r=float(loss_r))
+#
+#         return loss, aux
+#
+#     def get_state(self, o, batch_size=None):
+#
+#         if len(o) == 1:
+#             self.ae.eval()
+#             o0 = o.squeeze(0)
+#
+#             if hasattr(self.ae.encoder, 'embedding'):
+#                 # try batch correction
+#                 running_mean = self.ae.encoder.embedding.norm.running_mean
+#                 running_var = self.ae.encoder.embedding.norm.running_var
+#
+#                 self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
+#                 self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
+#
+#         with torch.no_grad():
+#             s, _ = self.ae(o)
+#
+#         if len(o) == 1:
+#             self.ae.train()
+#             if hasattr(self.ae.encoder, 'embedding'):
+#                 self.ae.encoder.embedding.norm.running_mean = running_mean
+#                 self.ae.encoder.embedding.norm.running_var = running_var
+#
+#         return s
+#
+#     def gen(self, o, a):
+#
+#         # only for learning (dont use with a single state)
+#         with torch.no_grad():
+#             s, _ = self.ae(o)
+#             c = torch.cat([s, a], dim=1)
+#             s2 = self.stag(c)
+#             r = self.r(c)
+#             d = torch.bernoulli(torch.sigmoid(self.d(c)))
+#
+#         return s, s2, r, d
+#
+#     def grad_q(self, c, gamma, v_net):
+#
+#         s2 = self.stag(c)
+#         v2 = v_net(s2)
+#         d = torch.sigmoid(self.d(c))
+#         rhat = self.r(c)
+#
+#         qa = (rhat + gamma * v2 * (1 - d)).mean()
+#
+#         return qa
 
-class DeterministicWorldModel(nn.Module):
+from torch._six import inf
+def clip_grad_norm(parameters, max_norm, norm_type=2):
 
-    def __init__(self, obs_dim, state_dim, act_dim):
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    device = parameters[0].grad.device
+    if norm_type == inf:
+        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
+    else:
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            if not p.grad.is_sparse:
+                p.grad[torch.isnan(p.grad)] = 0
+            p.grad.detach().mul_(clip_coef.to(p.grad.device))
+    return total_norm
+
+
+class FlowPolicy(nn.Module):
+
+    def __init__(self, state_dim, act_dim, K=20, nh=128):
+        super().__init__()
+
+        self.flow = ConditionalNormalizingFlowModel(act_dim, state_dim, B=1, K=K, nh=nh)
+
+    def sample(self, s, num_samples=1):
+        a = self.flow.sample(c=s, num_samples=num_samples)
+
+        return a.squeeze(0).squeeze(1)
+
+    def forward(self, s, a):
+        prior_logprob, conditional_logprob, log_det, conditional_log_det, kl = self.flow(a, s)
+
+        prior_logprob = prior_logprob.mean()
+        conditional_logprob = conditional_logprob.mean()
+        log_det = log_det.mean()
+        conditional_log_det = conditional_log_det.mean()
+        kl = kl.mean()
+
+        nll = -prior_logprob - conditional_logprob - log_det - conditional_log_det
+
+        loss = nll + 0.1 * kl
+
+        aux = dict(loss=float(loss),
+                   kl=float(kl),
+                   prior_logprob=float(prior_logprob),
+                   conditional_logprob=float(conditional_logprob),
+                   log_det=float(log_det),
+                   conditional_log_det=float(conditional_log_det))
+
+        return loss, aux
+
+
+class FlowWorldModel(nn.Module):
+
+    def __init__(self, obs_dim, state_dim, act_dim, B=5, K=20, nh=128):
         super().__init__()
 
         self.ae = SplineAutoEncoder(obs_dim, nh=state_dim, n_res=2, emb=16)
-
-        # self.r = SplineNet(state_dim + act_dim, n=1)
-        # self.d = SplineNet(state_dim + act_dim, n=1)
-        # self.stag = SplineNet(state_dim + act_dim, n=state_dim)
-
-        # self.r = MLP2Layers(state_dim + act_dim, 1, 128)
-        # self.d = MLP2Layers(state_dim + act_dim, 1, 128)
-        # self.stag = MLP2Layers(state_dim + act_dim, state_dim, 128)
-
         self.r = MLP(state_dim + act_dim, 1, 128, leak=0)
         self.d = MLP(state_dim + act_dim, 1, 128, leak=0)
-        self.stag = MLP(state_dim + act_dim, state_dim, 128, leak=0)
+        self.flow = ConditionalNormalizingFlowModel(state_dim, state_dim + act_dim, B=B, K=K, nh=nh)
+
+    def sample(self, o=None, a=None, c=None, num_samples=1):
+
+        if c is None:
+            batch = 1
+            if o is not None:
+                batch = len(o)
+                s = self.ae.encoder(o)
+                c = torch.cat([s, a], dim=1)
+        else:
+            batch = len(c)
+
+        s2 = self.flow.sample(c=c, num_samples=num_samples)
+
+        s2 = s2.view(num_samples * batch, -1)
+        o2 = self.ae.decoder(s2)
+        o2 = o2.view(num_samples, batch, -1)
+
+        return o2.squeeze(0).squeeze(1)
 
     def forward(self, o, a, r, o2, d):
 
         with torch.no_grad():
-            s2, o2hat = self.ae(o2)
+            s2 = self.ae.encoder(o2)
 
         s, ohat = self.ae(o)
 
         c = torch.cat([s, a], dim=1)
         rhat = self.r(c).squeeze(-1)
         dhat = self.d(c).squeeze(-1)
-        s2hat = self.stag(c).squeeze(-1)
 
-        loss_r = F.smooth_l1_loss(rhat, r, reduction='sum')
-        loss_stag = F.smooth_l1_loss(s2hat, s2, reduction='none').sum(dim=1).mean()
-        loss_d = F.binary_cross_entropy_with_logits(dhat, d, reduction='mean')
+        # important: detach the context befor pushing it through the flow
+        prior_logprob, conditional_logprob, log_det, conditional_log_det, kl = self.flow(s2, c.detach())
 
-        reg = torch.square(s).mean(dim=0)
-        reg = (reg - torch.log(reg)).sum(dim=-1)
-
-        rec = torch.square(o - ohat).sum(dim=-1).mean()
-
-        loss = 0.01 * (reg - 1) + rec + loss_r + loss_d + loss_stag
-
-        aux = dict(loss=float(loss), reg=float(reg), rec=float(rec), loss_stag=float(loss_stag),
-                   loss_d=float(loss_d), loss_r=float(loss_r))
-
-        return loss, aux
-
-    def get_state(self, o, batch_size=None):
-
-        if len(o) == 1:
-            self.ae.eval()
-            o0 = o.squeeze(0)
-
-            if hasattr(self.ae.encoder, 'embedding'):
-                # try batch correction
-                running_mean = self.ae.encoder.embedding.norm.running_mean
-                running_var = self.ae.encoder.embedding.norm.running_var
-
-                self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
-                self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
-
-        with torch.no_grad():
-            s, _ = self.ae(o)
-
-        if len(o) == 1:
-            self.ae.train()
-            if hasattr(self.ae.encoder, 'embedding'):
-                self.ae.encoder.embedding.norm.running_mean = running_mean
-                self.ae.encoder.embedding.norm.running_var = running_var
-
-        return s
-
-    def gen(self, o, a):
-
-        # only for learning (dont use with a single state)
-        with torch.no_grad():
-            s, _ = self.ae(o)
-            c = torch.cat([s, a], dim=1)
-            s2 = self.stag(c)
-            r = self.r(c)
-            d = torch.bernoulli(torch.sigmoid(self.d(c)))
-
-        return s, s2, r, d
-
-    def grad_q(self, c, gamma, v_net):
-
-        s2 = self.stag(c)
-        v2 = v_net(s2)
-        d = torch.sigmoid(self.d(c))
-        rhat = self.r(c)
-
-        qa = (rhat + gamma * v2 * (1 - d)).mean()
-
-        return qa
-
-
-class WorldModel(nn.Module):
-
-    def __init__(self, obs_dim, state_dim, act_dim, B=20, K=20):
-        super().__init__()
-
-        # self.ae = AutoEncoderFlow(obs_dim, obs_dim // 2, 256, w=1e-3)
-        self.ae = SplineAutoEncoder(obs_dim, nh=state_dim)
-        # self.ae = MLPAutoEncoder(obs_dim, nh=state_dim)
-        self.r = MLP2Layers(state_dim + act_dim, 1, 64)
-        self.d = MLP2Layers(state_dim + act_dim, 1, 64)
-
-        # flows = [NSF_CL(dim=state_dim, K=60, B=60, hidden_dim=16, base_network=MLP, contex_dim=state_dim+act_dim) for _ in range(1)]
-        flows = [NSF_CL(dim=state_dim, K=K, B=B, hidden_dim=16, base_network=MLP, contex_dim=state_dim + act_dim) for
-                 _ in range(1)]
-        convs = [Invertible1x1Conv(dim=state_dim) for _ in flows]
-        # norms = [ActNorm(dim=state_dim, eps=1e-3) for _ in flows]
-        norms = [ActNorm(dim=state_dim) for _ in flows]
-        flows = list(itertools.chain(*zip(norms, convs, flows)))
-
-        self.flow = ConditionalNormalizingFlowModel(flows, state_dim, state_dim+act_dim, 128)
-
-    def forward(self, o, a, r, o2, d):
-
-        with torch.no_grad():
-            s2, o2hat = self.ae(o2)
-
-        s, ohat = self.ae(o)
-
-        c = torch.cat([s, a], dim=1)
-        rhat = self.r(c)
-        dhat = self.d(c)
-
-        _, prior_logprob, log_det = self.flow(s2.detach(), c.detach())
         prior_logprob = prior_logprob.mean()
+        conditional_logprob = conditional_logprob.mean()
         log_det = log_det.mean()
+        conditional_log_det = conditional_log_det.mean()
+        kl = kl.mean()
 
-        s2_nll = -(prior_logprob + log_det)
+        nll = -prior_logprob - conditional_logprob - log_det - conditional_log_det
 
         loss_r = F.smooth_l1_loss(rhat, r, reduction='sum')
-        loss_d = F.binary_cross_entropy_with_logits(dhat, d, reduction='mean')
+        loss_d = F.binary_cross_entropy_with_logits(dhat, d, reduction='sum')
 
         reg = torch.square(s).mean(dim=0)
         reg = (reg - torch.log(reg)).sum(dim=-1)
-
         rec = torch.square(o - ohat).sum(dim=-1).mean()
 
-        loss = 0.01 * (reg - 1) + rec + loss_r + loss_d + s2_nll
+        loss = 0.01 * reg + rec + loss_r + loss_d + nll + 0.1 * kl
 
-        aux = dict(loss=float(loss), reg=float(reg), rec=float(rec), prior_logprob=float(prior_logprob),
-                   log_det=float(log_det), loss_d=float(loss_d), loss_r=float(loss_r))
+        aux = dict(loss=float(loss),
+                   reg=float(reg), rec=float(rec),
+                   loss_d=float(loss_d), loss_r=float(loss_r),
+                   kl=float(kl),
+                   prior_logprob=float(prior_logprob),
+                   conditional_logprob=float(conditional_logprob),
+                   log_det=float(log_det),
+                   conditional_log_det=float(conditional_log_det))
 
-        return loss, aux
-
-    def get_state(self, o, batch_size=None):
-
-        if len(o) == 1:
-            self.ae.eval()
-            o0 = o.squeeze(0)
-
-            if hasattr(self.ae.encoder, 'embedding'):
-                # try batch correction
-                running_mean = self.ae.encoder.embedding.norm.running_mean
-                running_var = self.ae.encoder.embedding.norm.running_var
-
-                self.ae.encoder.embedding.norm.running_mean = 1 / batch_size * o0 + (1 - 1 / batch_size) * running_mean
-                self.ae.encoder.embedding.norm.running_var = 1 / batch_size * (o0 - running_mean) ** 2 + (1 - 1 / batch_size) * running_var
-
-        with torch.no_grad():
-            s, _ = self.ae(o)
-
-        if len(o) == 1:
-            self.ae.train()
-            if hasattr(self.ae.encoder, 'embedding'):
-                self.ae.encoder.embedding.norm.running_mean = running_mean
-                self.ae.encoder.embedding.norm.running_var = running_var
-
-        return s
-
-    def gen(self, o, a):
-
-        # only for learning (dont use with a single state)
-        with torch.no_grad():
-            s, _ = self.ae(o)
-            c = torch.cat([s, a], dim=1)
-            s2 = self.flow.sample(c)
-            r = self.r(c)
-            d = torch.bernoulli(torch.sigmoid(self.d(c)))
-
-        return s, s2, r, d
-
-    def grad_q(self, c, gamma, v_net):
-
-        with torch.no_grad():
-            s2 = self.flow.sample(c)
-            v2 = v_net(s2)
-            d = torch.bernoulli(torch.sigmoid(self.d(c)))
-
-        rhat = self.r(c)
-        _, prior_logprob, log_det = self.flow(s2, c)
-
-        qa = (rhat + gamma * v2 * (1 - d) * (log_det + prior_logprob)).mean()
-
-        return qa
+        return loss, aux, s
 
 
 class MLPActorCritic(nn.Module):
 
-    def __init__(self, obs_dim, action_space, hidden_sizes=(256,256),
+    def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
                  activation=nn.ReLU):
         super().__init__()
 
+        obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         act_limit = action_space.high[0]
 
         # build policy and value functions
         self.pi = ActorFC(obs_dim, act_dim, hidden_sizes, activation, act_limit)
-        self.v = CriticFC(obs_dim, 0, hidden_sizes, activation)
+        self.q1 = CriticFC(obs_dim, act_dim, hidden_sizes, activation)
+        self.q2 = CriticFC(obs_dim, act_dim, hidden_sizes, activation)
 
     def act(self, obs, deterministic=False):
         with torch.no_grad():

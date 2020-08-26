@@ -11,10 +11,137 @@ import time
 import spinup.algos.pytorch.mbfq.core as core
 from spinup.utils.logx import EpochLogger
 from .spline_model import SparseDenseAdamOptimizer
-import torch.autograd as autograd
-import math
-import torch.nn.functional as F
+from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
+from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from tqdm import tqdm
+
+
+class VirtualEnv(object):
+
+    def __init__(self, rb, model):
+        super().__init__()
+
+        self.model = model
+        self.rb = rb
+        self.o, self.t, self.score, self.k = None, False, 0, 0
+        self.reset()
+
+    def __bool__(self):
+        return not bool(self.t)
+
+    def step(self, a):
+
+        training = self.model.training
+        self.model.eval()
+
+        if len(a) % 2:
+            a = np.append(a, 0)
+
+        a = torch.as_tensor(a, dtype=torch.float32, device=self.o.device).unsqueeze(0)
+
+        with torch.no_grad():
+            s = self.model.ae.encoder(self.o)
+
+            c = torch.cat([s, a], dim=-1)
+            r = float(self.model.r(c))
+            d = bool(torch.bernoulli(torch.sigmoid(self.model.d(c))))
+            o = self.model.sample(c=c, num_samples=1)
+
+        self.t = d
+        self.score += r
+        self.s = s
+
+        if training:
+            self.model.train()
+
+        return o.squeeze(0).cpu().numpy(), r, d, {}
+
+    def reset(self):
+
+        self.t, self.score, self.k = False, 0, 0
+
+        # i = torch.randint(len(self.rb), size=(1,)).item()
+        # self.o = self.rb['obs'][i].unsqueeze(0)
+
+        sample = self.rb.sample_batch(batch_size=1)
+        self.o = sample['obs']
+
+        return self.o.squeeze(0).cpu().numpy()
+
+
+class PPOBuffer:
+    """
+    A buffer for storing trajectories experienced by a PPO agent interacting
+    with the environment, and using Generalized Advantage Estimation (GAE-Lambda)
+    for calculating the advantages of state-action pairs.
+    """
+
+    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.adv_buf = np.zeros(size, dtype=np.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.ret_buf = np.zeros(size, dtype=np.float32)
+        self.val_buf = np.zeros(size, dtype=np.float32)
+        self.logp_buf = np.zeros(size, dtype=np.float32)
+        self.gamma, self.lam = gamma, lam
+        self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+
+    def store(self, obs, act, rew, val, logp):
+        """
+        Append one timestep of agent-environment interaction to the buffer.
+        """
+        assert self.ptr < self.max_size  # buffer has to have room so you can store
+        self.obs_buf[self.ptr] = obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.val_buf[self.ptr] = val
+        self.logp_buf[self.ptr] = logp
+        self.ptr += 1
+
+    def finish_path(self, last_val=0):
+        """
+        Call this at the end of a trajectory, or when one gets cut off
+        by an epoch ending. This looks back in the buffer to where the
+        trajectory started, and uses rewards and value estimates from
+        the whole trajectory to compute advantage estimates with GAE-Lambda,
+        as well as compute the rewards-to-go for each state, to use as
+        the targets for the value function.
+
+        The "last_val" argument should be 0 if the trajectory ended
+        because the agent reached a terminal state (died), and otherwise
+        should be V(s_T), the value function estimated for the last state.
+        This allows us to bootstrap the reward-to-go calculation to account
+        for timesteps beyond the arbitrary episode horizon (or epoch cutoff).
+        """
+
+        path_slice = slice(self.path_start_idx, self.ptr)
+        rews = np.append(self.rew_buf[path_slice], last_val)
+        vals = np.append(self.val_buf[path_slice], last_val)
+
+        # the next two lines implement GAE-Lambda advantage calculation
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+
+        # the next line computes rewards-to-go, to be targets for the value function
+        self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
+
+        self.path_start_idx = self.ptr
+
+    def get(self):
+        """
+        Call this at the end of an epoch to get all of the data from
+        the buffer, with advantages appropriately normalized (shifted to have
+        mean zero and std one). Also, resets some pointers in the buffer.
+        """
+        assert self.ptr == self.max_size  # buffer has to be full before you can get
+        self.ptr, self.path_start_idx = 0, 0
+        # the next two lines implement the advantage normalization trick
+        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
+                    adv=self.adv_buf, logp=self.logp_buf)
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in data.items()}
 
 
 class ReplayBuffer:
@@ -54,9 +181,11 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
          steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
          polyak=0.995, lr=1e-3, alpha=0.2, batch_size=128, start_steps=10000,
          update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
-         logger_kwargs=dict(), save_freq=1, update_factor=1, device='cuda'):
+         logger_kwargs=dict(), save_freq=1, update_factor=1, device='cuda', lam=0.97, steps_per_ppo_update=1000,
+         n_ppo_updates=10, train_pi_iters=80, target_kl=0.01, clip_ratio=0.2):
 
     device = torch.device(device)
+
     logger = EpochLogger(**logger_kwargs)
     logger.save_config(locals())
 
@@ -70,18 +199,11 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     # Action limit for clamping: critically, assumes all dimensions share the same bound!
     act_limit = env.action_space.high[0]
 
-    # state_dim = {376: 144, 111: 64, 17: 12, 11: 8}[obs_dim[0]]
-    state_dim = 128
-    # Create actor-critic module and target networks
-    ac = core.MLPActorCritic(state_dim, env.action_space, **ac_kwargs).to(device)
-    # model = core.WorldModel(obs_dim[0], state_dim, act_dim).to(device)
-    model = core.DeterministicWorldModel(obs_dim[0], 128, act_dim).to(device)
+    state_dim = {376: 144, 111: 64, 17: 12, 11: 8}[obs_dim[0]]
 
-    # temporary hook
-    environment = 'halfcheetah'
-    root_dir = '/mnt/dsi_vol1/users/elads/data/spinningup/data'
-    log_dir = os.path.join(root_dir, f'{environment}_world_model')
-    model.load_state_dict(torch.load(os.path.join(log_dir, 'model')))
+    # Create actor-critic module and target networks
+    ac = core.MLPActorCritic(env.observation_space, env.action_space, **ac_kwargs).to(device)
+    model = core.FlowWorldModel(obs_dim[0], state_dim, act_dim).to(device)
 
     ac_targ = deepcopy(ac)
 
@@ -89,77 +211,74 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     for p in ac_targ.parameters():
         p.requires_grad = False
 
+    # List of parameters for both Q-networks (save this for convenience)
+    q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+
     # Experience buffer
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
+    ppo_buffer = PPOBuffer(obs_dim, act_dim, steps_per_ppo_update, gamma, lam)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.v, model.r, model.ae])
-    logger.log('\nNumber of parameters: \t pi: %d, \t v: %d, \t r: %d, \t ae: %d\n' % var_counts)
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, model])
+    logger.log('\nNumber of parameters: \t pi: %d, \t q: %d, \t model: %d\n' % var_counts)
 
     # Set up function for computing SAC Q-losses
     def compute_loss_model(data):
 
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-        loss_model, model_info = model(o, a, r, o2, d)
 
-        return loss_model, model_info
+        loss, info, _ = model(o, a, r, o2, d)
+
+        return loss, info
 
     # Set up function for computing SAC Q-losses
-    def compute_loss_v(data):
-
+    def compute_loss_q(data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
 
-        # s, s2, r, d = model.gen(o, a)
-        #
-        # with torch.no_grad():
-        #
-        #     v2 = ac_targ.v(s2)
-        #     g_target = r + gamma * (1 - d) * v2
-        #     _, logp_pi = ac.pi(s)
+        q1 = ac.q1(o,a)
+        q2 = ac.q2(o,a)
 
+        # Bellman backup for Q functions
         with torch.no_grad():
-            s = model.get_state(o)
-            s2 = model.get_state(o2)
-            v2 = ac_targ.v(s2)
-            g_target = r + gamma * (1 - d) * v2
-            _, logp_pi = ac.pi(s)
+            # Target actions come from *current* policy
+            a2, logp_a2 = ac.pi(o2)
 
-        v = ac.v(s)
+            # Target Q-values
+            q1_pi_targ = ac_targ.q1(o2, a2)
+            q2_pi_targ = ac_targ.q2(o2, a2)
+            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            backup = r + gamma * (1 - d) * (q_pi_targ - alpha * logp_a2)
 
-        loss_v = ((v - g_target + alpha * logp_pi) ** 2).mean()
+        # MSE loss against Bellman backup
+        loss_q1 = ((q1 - backup)**2).mean()
+        loss_q2 = ((q2 - backup)**2).mean()
+        loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        v_info = dict(VVals=v.detach().cpu().numpy())
+        q_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                      Q2Vals=q2.detach().cpu().numpy())
 
-        return loss_v, v_info
+        return loss_q, q_info
 
     # Set up function for computing SAC pi loss
     def compute_loss_pi(data):
         o = data['obs']
+        pi, logp_pi = ac.pi(o)
+        q1_pi = ac.q1(o, pi)
+        q2_pi = ac.q2(o, pi)
+        q_pi = torch.min(q1_pi, q2_pi)
 
-        with torch.no_grad():
-            s = model.get_state(o)
-
-        pi, logp_pi = ac.pi(s)
-        c = torch.cat([s, pi], dim=1)
-
-        # grad_q = model.grad_q(s, pi.detach(), gamma, ac.v)
-        qa = model.grad_q(c, gamma, ac.v)
-        loss_pi = (alpha * logp_pi - qa).mean()
-
-        # loss_pi = (alpha * logp_pi - (grad_q * pi).sum(-1)).mean()
+        # Entropy-regularized policy loss
+        loss_pi = (alpha * logp_pi - q_pi).mean()
 
         # Useful info for logging
-        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy(),
-                       # GradQAmp=torch.norm(grad_q, dim=-1).detach().cpu().numpy(),
-                       ActionsNorm=torch.norm(pi, dim=-1).detach().cpu().numpy(),
-                       ActionsAbs=torch.abs(pi).flatten().detach().cpu().numpy(), )
+        pi_info = dict(LogPi=logp_pi.detach().cpu().numpy())
 
         return loss_pi, pi_info
 
+    # Set up optimizers for policy and q-function
     pi_optimizer = Adam(ac.pi.parameters(), lr=lr)
-    v_optimizer = Adam(ac.v.parameters(), lr=lr)
-    # model_optimizer = Adam(model.parameters(), lr=lr)
+    q_optimizer = Adam(q_params, lr=lr)
     model_optimizer = SparseDenseAdamOptimizer(model, dense_args={'lr': lr}, sparse_args={'lr': 10 * lr})
 
     # Set up model saving
@@ -167,27 +286,39 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     def update(data):
 
-        # First run one gradient descent step for the world-model
-        # loss_model, model_info = compute_loss_model(data)
-        # model_optimizer.zero_grad()
-        # loss_model.backward()
-        # model_optimizer.step()
-        # # Record things
-        # logger.store(LossModel=loss_model.item(), **model_info)
+        loss_model, model_info = compute_loss_model(data)
+        model_optimizer.zero_grad()
+        loss_model.backward()
+        core.clip_grad_norm(model.parameters(), 1000)
+        model_optimizer.step()
 
-        # next run one gradient descent step for the world-model
-        loss_v, v_info = compute_loss_v(data)
-        v_optimizer.zero_grad()
-        loss_v.backward()
-        v_optimizer.step()
         # Record things
-        logger.store(LossV=loss_v.item(), **v_info)
+        logger.store(LossModel=loss_model.item(), **model_info)
+
+        # First run one gradient descent step for Q1 and Q2
+        q_optimizer.zero_grad()
+        loss_q, q_info = compute_loss_q(data)
+        loss_q.backward()
+        q_optimizer.step()
+
+        # Record things
+        logger.store(LossQ=loss_q.item(), **q_info)
+
+        # Freeze Q-networks so you don't waste computational effort
+        # computing gradients for them during the policy learning step.
+        for p in q_params:
+            p.requires_grad = False
 
         # Next run one gradient descent step for pi.
-        loss_pi, pi_info = compute_loss_pi(data)
         pi_optimizer.zero_grad()
+        loss_pi, pi_info = compute_loss_pi(data)
         loss_pi.backward()
         pi_optimizer.step()
+
+        # Unfreeze Q-networks so you can optimize it at next DDPG step.
+        for p in q_params:
+            p.requires_grad = True
+
         # Record things
         logger.store(LossPi=loss_pi.item(), **pi_info)
 
@@ -201,8 +332,114 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     def get_action(o, deterministic=False):
 
-        s = model.get_state(torch.as_tensor(o, dtype=torch.float32, device=device).unsqueeze(0), batch_size=batch_size).squeeze(0)
-        return ac.act(s, deterministic)
+        # s = model.get_state(torch.as_tensor(o, dtype=torch.float32, device=device).unsqueeze(0), batch_size=batch_size).squeeze(0)
+        # return ac.act(o, deterministic)
+        return ac.act(torch.as_tensor(o, dtype=torch.float32, device=device),
+                      deterministic)
+
+    # Set up function for computing PPO policy loss
+    def ppo_compute_loss_pi(data):
+        obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
+
+        # Policy loss
+        pi, logp = ac.pi(obs, act)
+        ratio = torch.exp(logp - logp_old)
+        clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
+        loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+
+        # Useful extra info
+        approx_kl = (logp_old - logp).mean().item()
+        ent = pi.entropy().mean().item()
+        clipped = ratio.gt(1+clip_ratio) | ratio.lt(1-clip_ratio)
+        clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
+        pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
+
+        return loss_pi, pi_info
+
+    def ppo_step(o):
+
+        with torch.no_grad():
+            a, log_pi = ac.pi(torch.as_tensor(o, dtype=torch.float32, device=device))
+            q1_pi = ac.q1(o, a)
+            q2_pi = ac.q2(o, a)
+            q_pi = torch.min(q1_pi, q2_pi)
+            v = (alpha * log_pi - q_pi).cpu().numpy()
+
+        return a.cpu().numpy(), v.cpu().numpy(), log_pi.cpu().numpy()
+
+    def virtual_ppo():
+
+        venv = VirtualEnv(model, replay_buffer)
+        ac_targ.pi.load_state_dict(ac.state_dict())
+
+        # Main loop: collect experience in env and update/log each epoch
+
+        for epoch in range(n_ppo_updates):
+
+            o, ep_ret, ep_len = venv.reset(), 0, 0
+
+            for t in range(steps_per_ppo_update):
+
+                a, v, log_pi = ppo_step(o)
+
+                next_o, r, d, _ = venv.step(a)
+                ep_ret += r
+                ep_len += 1
+
+                # save and log
+                ppo_buffer.store(o, a, r, v, log_pi)
+                logger.store(VVals=v)
+
+                # Update obs (critical!)
+                o = next_o
+
+                timeout = ep_len == max_ep_len
+                terminal = d or timeout
+                epoch_ended = t == steps_per_epoch - 1
+
+                if terminal or epoch_ended:
+                    if epoch_ended and not terminal:
+                        print('Warning: trajectory cut off by epoch at %d steps.' % ep_len, flush=True)
+                    # if trajectory didn't reach terminal state, bootstrap value target
+                    if timeout or epoch_ended:
+                        _, v, _ = ppo_step(o)
+
+                    else:
+                        v = 0
+                    ppo_buffer.finish_path(v)
+                    if terminal:
+                        # only save EpRet / EpLen if trajectory finished
+                        logger.store(EpRet=ep_ret, EpLen=ep_len)
+                    o, ep_ret, ep_len = env.reset(), 0, 0
+
+            # Save model
+            if (epoch % save_freq == 0) or (epoch == epochs - 1):
+                logger.save_state({'env': env}, None)
+
+            # Perform PPO update!
+            data = ppo_buffer.get()
+
+            pi_l_old, pi_info_old = ppo_compute_loss_pi(data)
+            pi_l_old = pi_l_old.item()
+
+            # Train policy with multiple steps of gradient descent
+            for i in range(train_pi_iters):
+                pi_optimizer.zero_grad()
+                loss_pi, pi_info = ppo_compute_loss_pi(data)
+                kl = mpi_avg(pi_info['kl'])
+                if kl > 1.5 * target_kl:
+                    logger.log('Early stopping at step %d due to reaching max kl.' % i)
+                    break
+                loss_pi.backward()
+                mpi_avg_grads(ac.pi)  # average grads across MPI processes
+                pi_optimizer.step()
+
+            logger.store(StopIter=i)
+
+            # Log changes from update
+            kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
+            logger.store(LossPi=pi_l_old, KL=kl, Entropy=ent, ClipFrac=cf,
+                         DeltaLossPi=(loss_pi.item() - pi_l_old))
 
     def test_agent():
         for j in range(num_test_episodes):
@@ -222,7 +459,6 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     # Main loop: collect experience in env and update/log each epoch
     for t in tqdm(range(total_steps)):
 
-        # eps = math.exp(math.log(1.) + (math.log(0.03) - math.log(1.)) * math.sin(2 * math.pi * t / 200e3))
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards, 
         # use the learned policy. 
@@ -277,16 +513,13 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('VVals', with_min_and_max=True)
+            logger.log_tabular('Q1Vals', with_min_and_max=True)
+            logger.log_tabular('Q2Vals', with_min_and_max=True)
             logger.log_tabular('LogPi', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossV', average_only=True)
-            # logger.log_tabular('LossModel', average_only=True)
-            # logger.log_tabular('GradQAmp', with_min_and_max=True)
-            logger.log_tabular('ActionsNorm', with_min_and_max=True)
-            logger.log_tabular('ActionsAbs', with_min_and_max=True)
-
-            logger.log_tabular('Time', time.time() - start_time)
+            logger.log_tabular('LossQ', average_only=True)
+            logger.log_tabular('LossModel', average_only=True)
+            logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
 
 
@@ -313,7 +546,7 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
-    print("EGL Experiment")
+    print("MBFQ Experiment")
     mbfq(lambda: gym.make(args.env), ac_kwargs=dict(hidden_sizes=[args.hid] * args.l),
          gamma=args.gamma, seed=args.seed, epochs=args.epochs, logger_kwargs=logger_kwargs,
          device=args.device, batch_size=args.batch_size)

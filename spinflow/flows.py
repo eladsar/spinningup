@@ -43,6 +43,8 @@ from torch.distributions.utils import _standard_normal, broadcast_all
 from torch.distributions.exp_family import ExponentialFamily
 from numbers import Number
 from torch.distributions import constraints
+import itertools
+from .spline_flows import NSF_CL
 
 import math
 
@@ -63,8 +65,12 @@ class MyNormal(ExponentialFamily):
         return self.scale
 
     @property
+    def kl_normal(self):
+        return (self.variance + self.mean ** 2) / 2 - self.logscale - 0.5
+
+    @property
     def variance(self):
-        return self.scale.pow(2)
+        return torch.exp(self.logscale * 2)
 
     def __init__(self, loc, logscale, validate_args=None):
 
@@ -448,69 +454,89 @@ class ConditionalNormalizingFlow(nn.Module):
 class ConditionalNormalizingFlowModel(nn.Module):
     """ A Normalizing Flow Model is a (prior, flow) pair """
 
-    def __init__(self, flows, x_dim, c_dim, nh):
+    def __init__(self, x_dim, c_dim, B=20, K=20, nh=128):
         super().__init__()
-        self.flow = ConditionalNormalizingFlow(flows)
-        self.context_mlp = MLP(c_dim, nh, nh)
-        self.loc = nn.Sequential(nn.ReLU(),
-                                nn.Linear(nh, x_dim))
-        self.logscale = nn.Sequential(nn.ReLU(),
-                                nn.Linear(nh, x_dim))
-        self.context = nn.Sequential(nn.ReLU(),
-                                nn.Linear(nh, c_dim))
 
-        self.c = None
-        self.prior = None
+        # Define the primery flow
+
+        flows = [NSF_CL(dim=x_dim, K=K, B=B, hidden_dim=16, base_network=MLP) for _ in range(1)]
+        convs = [Invertible1x1Conv(dim=x_dim) for _ in flows]
+        norms = [ActNorm(dim=x_dim) for _ in flows]
+        flows = list(itertools.chain(*zip(norms, convs, flows)))
+        self.flow_x = ConditionalNormalizingFlow(flows)
+
+        # Define the secondary flow
+
+        flows = [NSF_CL(dim=x_dim, K=K, B=B, hidden_dim=16, base_network=MLP) for _ in range(1)]
+        convs = [Invertible1x1Conv(dim=x_dim) for _ in flows]
+        norms = [ActNorm(dim=x_dim) for _ in flows]
+        flows = list(itertools.chain(*zip(norms, convs, flows)))
+        self.flow_c = ConditionalNormalizingFlow(flows)
+
+        self.x_loc = MLP(c_dim, x_dim, nh, leak=0)
+        self.x_logscale = MLP(c_dim, x_dim, nh, leak=0)
+
+        self.register_buffer('prior_loc', torch.zeros(x_dim))
+        self.register_buffer('prior_logscale', torch.zeros(x_dim))
+        self.conditional_prior = None
 
     def forward(self, x, c):
 
-        c = self.context_mlp(c)
-        loc = self.loc(c)
-        logscale = self.logscale(c)
-        self.c = c = self.context(c)
+        prior = MyNormal(loc=self.prior_loc, logscale=self.prior_logscale)
+
+        loc = self.x_loc(c)
+        logscale = self.x_logscale(c)
 
         params = {'loc': loc, 'logscale': logscale}
-        self.prior = MyNormal(**params)
+        conditional_prior = MyNormal(**params)
 
-        zs, log_det = self.flow.forward(x, c)
-        prior_logprob = self.prior.log_prob(zs[-1]).view(x.size(0), -1).sum(1)
-        return zs, prior_logprob, log_det
+        kl = conditional_prior.kl_normal.sum(dim=1)
 
-    def backward(self, z, c):
+        self.conditional_prior = conditional_prior
 
-        c = self.context_mlp(c)
-        loc = self.loc(c)
-        logscale = self.logscale(c)
-        c = self.context(c)
+        zs, log_det = self.flow_x.forward(x)
+        z = zs[-1]
 
-        params = {'loc': loc, 'logscale': logscale}
-        self.prior = MyNormal(**params)
+        prior_logprob = prior.log_prob(z).sum(1)
 
-        xs, log_det = self.flow.backward(z, c)
-        return xs, log_det
+        zs, log_det_conditional = self.flow_c.forward(z)
+        z = zs[-1]
+
+        conditional_log_det = log_det + log_det_conditional
+        conditional_logprob = conditional_prior.log_prob(z).sum(1)
+
+        return prior_logprob, conditional_logprob, log_det, conditional_log_det, kl
+
+    def freeze(self, fr=True):
+        for param in self.parameters():
+            param.requires_grad = not fr
 
     def sample(self, c=None, num_samples=1):
 
         if c is not None:
-            c = self.context_mlp(c)
-            loc = self.loc(c)
-            logscale = self.logscale(c)
-            c = self.context(c)
+            loc = self.x_loc(c)
+            logscale = self.x_logscale(c)
 
             params = {'loc': loc, 'logscale': logscale}
-            prior = MyNormal(**params)
+            conditional_prior = MyNormal(**params)
+
+            z = conditional_prior.sample((num_samples,))
+            _, b, _ = z.shape
+            z = z.view(num_samples * b, -1)
+
+            zs, _ = self.flow_c.backward(z)
+            z = zs[-1]
 
         else:
-            prior = self.prior
-            c = self.c
 
-        z = prior.sample((num_samples,))
-        _, b, _ = z.shape
+            prior = MyNormal(loc=self.prior_loc, logscale=self.prior_logscale)
+            z = prior.sample((num_samples,))
 
-        z = z.view(num_samples * b, -1)
+        xs, _ = self.flow_x.backward(z)
+        x = xs[-1]
 
-        xs, _ = self.flow.backward(z, c)
-        xs = xs[-1].view(num_samples, b, -1).squeeze(0)
+        if c is not None:
+            x = x.view(num_samples, b, -1)
 
-        return xs
+        return x.squeeze(0)
 

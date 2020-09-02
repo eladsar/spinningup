@@ -11,6 +11,7 @@ import time
 import spinup.algos.pytorch.mbfq.core as core
 from spinup.utils.logx import EpochLogger
 from .spline_model import SparseDenseAdamOptimizer
+from spinup.algos.pytorch.ppo.core import discount_cumsum
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from tqdm import tqdm
@@ -76,7 +77,7 @@ class PPOBuffer:
     for calculating the advantages of state-action pairs.
     """
 
-    def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+    def __init__(self, obs_dim, act_dim, size, device, gamma=0.99, lam=0.95):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
@@ -84,6 +85,7 @@ class PPOBuffer:
         self.ret_buf = np.zeros(size, dtype=np.float32)
         self.val_buf = np.zeros(size, dtype=np.float32)
         self.logp_buf = np.zeros(size, dtype=np.float32)
+        self.device = device
         self.gamma, self.lam = gamma, lam
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
 
@@ -121,10 +123,10 @@ class PPOBuffer:
 
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+        self.adv_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
 
         # the next line computes rewards-to-go, to be targets for the value function
-        self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
 
         self.path_start_idx = self.ptr
 
@@ -137,11 +139,11 @@ class PPOBuffer:
         assert self.ptr == self.max_size  # buffer has to be full before you can get
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        # adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
+        # self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in data.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=self.device) for k, v in data.items()}
 
 
 class ReplayBuffer:
@@ -178,11 +180,11 @@ class ReplayBuffer:
 
 
 def mbfq(env_fn, ac_kwargs=dict(), seed=0,
-         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99,
+         steps_per_epoch=2000, epochs=100, replay_size=int(1e6), gamma=0.99,
          polyak=0.995, lr=1e-3, alpha=0.2, batch_size=128, start_steps=10000,
-         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000,
+         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, max_ep_len_ppo=50,
          logger_kwargs=dict(), save_freq=1, update_factor=1, device='cuda', lam=0.97, steps_per_ppo_update=1000,
-         n_ppo_updates=10, train_pi_iters=80, target_kl=0.01, clip_ratio=0.2):
+         n_ppo_updates=1, train_pi_iters=80, target_kl=0.01, clip_ratio=0.2):
 
     device = torch.device(device)
 
@@ -203,7 +205,8 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     # Create actor-critic module and target networks
     ac = core.MLPActorCritic(env.observation_space, env.action_space, **ac_kwargs).to(device)
-    model = core.FlowWorldModel(obs_dim[0], state_dim, act_dim).to(device)
+
+    model = core.FlowWorldModel(obs_dim[0], state_dim, act_dim+int(act_dim % 2)).to(device)
 
     ac_targ = deepcopy(ac)
 
@@ -216,7 +219,7 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
     # Experience buffer
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
-    ppo_buffer = PPOBuffer(obs_dim, act_dim, steps_per_ppo_update, gamma, lam)
+    ppo_buffer = PPOBuffer(obs_dim, act_dim, steps_per_ppo_update,  gamma=gamma, lam=lam, device=device)
 
     # Count variables (protip: try to get a feel for how different size networks behave!)
     var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, model])
@@ -226,6 +229,9 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
     def compute_loss_model(data):
 
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        if act_dim % 2:
+            a = torch.cat([a, torch.zeros(len(a), 1, device=a.device)], dim=1)
 
         loss, info, _ = model(o, a, r, o2, d)
 
@@ -342,35 +348,36 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
 
         # Policy loss
-        pi, logp = ac.pi(obs, act)
+        ac.pi(obs)
+        logp = ac.pi.log_prob(act, desquash=True)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
-        ent = pi.entropy().mean().item()
         clipped = ratio.gt(1+clip_ratio) | ratio.lt(1-clip_ratio)
         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
-        pi_info = dict(kl=approx_kl, ent=ent, cf=clipfrac)
+        pi_info = dict(kl=approx_kl, cf=clipfrac)
 
         return loss_pi, pi_info
 
     def ppo_step(o):
 
         with torch.no_grad():
-            a, log_pi = ac.pi(torch.as_tensor(o, dtype=torch.float32, device=device))
+            o = torch.as_tensor(o, dtype=torch.float32, device=device)
+            a, log_pi = ac_targ.pi(o)
             q1_pi = ac.q1(o, a)
             q2_pi = ac.q2(o, a)
             q_pi = torch.min(q1_pi, q2_pi)
-            v = (alpha * log_pi - q_pi).cpu().numpy()
+            v = (alpha * log_pi - q_pi).squeeze(0).cpu().numpy()
 
-        return a.cpu().numpy(), v.cpu().numpy(), log_pi.cpu().numpy()
+        return a.squeeze(0).cpu().numpy(), v, log_pi.squeeze(0).cpu().numpy()
 
     def virtual_ppo():
 
-        venv = VirtualEnv(model, replay_buffer)
-        ac_targ.pi.load_state_dict(ac.state_dict())
+        venv = VirtualEnv(replay_buffer, model)
+        ac_targ.pi.load_state_dict(ac.pi.state_dict())
 
         # Main loop: collect experience in env and update/log each epoch
 
@@ -378,7 +385,7 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
             o, ep_ret, ep_len = venv.reset(), 0, 0
 
-            for t in range(steps_per_ppo_update):
+            for t in tqdm(range(steps_per_ppo_update)):
 
                 a, v, log_pi = ppo_step(o)
 
@@ -393,7 +400,7 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
                 # Update obs (critical!)
                 o = next_o
 
-                timeout = ep_len == max_ep_len
+                timeout = ep_len == max_ep_len_ppo
                 terminal = d or timeout
                 epoch_ended = t == steps_per_epoch - 1
 
@@ -409,7 +416,7 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
                     ppo_buffer.finish_path(v)
                     if terminal:
                         # only save EpRet / EpLen if trajectory finished
-                        logger.store(EpRet=ep_ret, EpLen=ep_len)
+                        logger.store(VirtualEpRet=ep_ret, VirtualEpLen=ep_len)
                     o, ep_ret, ep_len = env.reset(), 0, 0
 
             # Save model
@@ -424,21 +431,24 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
 
             # Train policy with multiple steps of gradient descent
             for i in range(train_pi_iters):
-                pi_optimizer.zero_grad()
+
                 loss_pi, pi_info = ppo_compute_loss_pi(data)
-                kl = mpi_avg(pi_info['kl'])
+                # kl = mpi_avg(pi_info['kl'])
+                kl = pi_info['kl']
                 if kl > 1.5 * target_kl:
                     logger.log('Early stopping at step %d due to reaching max kl.' % i)
                     break
+
+                pi_optimizer.zero_grad()
                 loss_pi.backward()
-                mpi_avg_grads(ac.pi)  # average grads across MPI processes
+                # mpi_avg_grads(ac.pi)  # average grads across MPI processes
                 pi_optimizer.step()
 
             logger.store(StopIter=i)
 
             # Log changes from update
-            kl, ent, cf = pi_info['kl'], pi_info_old['ent'], pi_info['cf']
-            logger.store(LossPi=pi_l_old, KL=kl, Entropy=ent, ClipFrac=cf,
+            kl, cf = pi_info['kl'], pi_info['cf']
+            logger.store(LossPi=pi_l_old, KL=kl, ClipFrac=cf,
                          DeltaLossPi=(loss_pi.item() - pi_l_old))
 
     def test_agent():
@@ -506,11 +516,15 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
             # Test the performance of the deterministic version of the agent.
             test_agent()
 
+            virtual_ppo()
+
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
             logger.log_tabular('EpRet', with_min_and_max=True)
             logger.log_tabular('TestEpRet', with_min_and_max=True)
             logger.log_tabular('EpLen', average_only=True)
+            logger.log_tabular('VirtualEpRet', with_min_and_max=True)
+            logger.log_tabular('VirtualEpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
             logger.log_tabular('Q1Vals', with_min_and_max=True)
@@ -519,6 +533,18 @@ def mbfq(env_fn, ac_kwargs=dict(), seed=0,
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('LossModel', average_only=True)
+            logger.log_tabular('reg', average_only=True)
+            logger.log_tabular('rec', average_only=True)
+            logger.log_tabular('loss_d', average_only=True)
+            logger.log_tabular('loss_r', average_only=True)
+            logger.log_tabular('kl', average_only=True)
+            logger.log_tabular('prior_logprob', average_only=True)
+            logger.log_tabular('log_det', average_only=True)
+            logger.log_tabular('conditional_log_det', average_only=True)
+            logger.log_tabular('conditional_logprob', average_only=True)
+            logger.log_tabular('KL', average_only=True)
+            logger.log_tabular('ClipFrac', average_only=True)
+            logger.log_tabular('StopIter', average_only=True)
             logger.log_tabular('Time', time.time()-start_time)
             logger.dump_tabular()
 

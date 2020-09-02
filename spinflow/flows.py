@@ -45,6 +45,7 @@ from numbers import Number
 from torch.distributions import constraints
 import itertools
 from .spline_flows import NSF_CL
+from .spline_embeddings import SplineNet
 
 import math
 
@@ -129,6 +130,55 @@ class MyNormal(ExponentialFamily):
 
     def _log_normalizer(self, x, y):
         return -0.25 * x.pow(2) / y + 0.5 * torch.log(-math.pi / y)
+
+
+class AffineHalfEmbeddingFlow(nn.Module):
+    """
+    As seen in RealNVP, affine autoregressive flow (z = x * exp(s) + t), where half of the
+    dimensions in x are linearly scaled/transfromed as a function of the other half.
+    Which half is which is determined by the parity bit.
+    - RealNVP both scales and shifts (default)
+    - NICE only shifts
+    """
+
+    def __init__(self, dim, parity, scale=True, shift=True, emb=16, layer=64, delta=10, n_res=2):
+        super().__init__()
+        self.dim = dim
+        self.parity = parity
+        self.s_cond = lambda x: x.new_zeros(x.size(0), self.dim // 2)
+        self.t_cond = lambda x: x.new_zeros(x.size(0), self.dim // 2)
+        if scale:
+            self.s_cond = SplineNet(self.dim // 2, emb=emb, layer=layer, delta=delta, n=self.dim // 2, n_res=n_res)
+        if shift:
+            self.t_cond = SplineNet(self.dim // 2, emb=emb, layer=layer, delta=delta, n=self.dim // 2, n_res=n_res)
+
+    def forward(self, x, c=None):
+        x0, x1 = x[:, ::2], x[:, 1::2]
+        if self.parity:
+            x0, x1 = x1, x0
+        s = self.s_cond(x0)
+        t = self.t_cond(x0)
+        z0 = x0  # untouched half
+        z1 = torch.exp(s) * x1 + t  # transform this half as a function of the other
+        if self.parity:
+            z0, z1 = z1, z0
+        z = torch.cat([z0, z1], dim=1)
+        log_det = torch.sum(s, dim=1)
+        return z, log_det
+
+    def backward(self, z, c=None):
+        z0, z1 = z[:, ::2], z[:, 1::2]
+        if self.parity:
+            z0, z1 = z1, z0
+        s = self.s_cond(z0)
+        t = self.t_cond(z0)
+        x0 = z0  # this was the same
+        x1 = (z1 - t) * torch.exp(-s)  # reverse the transform on this half
+        if self.parity:
+            x0, x1 = x1, x0
+        x = torch.cat([x0, x1], dim=1)
+        log_det = torch.sum(-s, dim=1)
+        return x, log_det
 
 
 class AutoEncoderFlow(nn.Module):
@@ -349,6 +399,8 @@ class Invertible1x1Conv(nn.Module):
         self.S = nn.Parameter(U.diag())  # "crop out" the diagonal to its own parameter
         self.U = nn.Parameter(torch.triu(U, diagonal=1))  # "crop out" diagonal, stored in S
 
+        self.W_inv = None
+
     def _assemble_W(self):
         """ assemble W from its pieces (P, L, U, S) """
         L = torch.tril(self.L, diagonal=-1) + torch.diag(torch.ones(self.dim, device=self.L.device))
@@ -360,12 +412,16 @@ class Invertible1x1Conv(nn.Module):
         W = self._assemble_W()
         z = x @ W
         log_det = torch.sum(torch.log(torch.abs(self.S)))
+        self.W_inv = None
         return z, log_det
 
     def backward(self, z, c=None):
-        W = self._assemble_W()
-        W_inv = torch.inverse(W)
-        x = z @ W_inv
+
+        if self.W_inv is None:
+            W = self._assemble_W()
+            self.W_inv = torch.inverse(W)
+
+        x = z @ self.W_inv
         log_det = -torch.sum(torch.log(torch.abs(self.S)))
         return x, log_det
 

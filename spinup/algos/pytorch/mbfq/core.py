@@ -455,7 +455,10 @@ class ActorFC(nn.Module):
     def sample(self, n=None, deterministic=False, ratio=1., mean=None):
         return self._sample('sample', n=n, deterministic=deterministic, ratio=ratio, mean=mean)
 
-    def log_prob(self, a):
+    def log_prob(self, a, desquash=False):
+
+        if desquash:
+            a = atanh(a / self.act_limit)
 
         distribution = self.distribution.expand(a.shape)
 

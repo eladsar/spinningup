@@ -299,7 +299,7 @@ class Logger:
                 torch.save(self.pytorch_saver_elements, fname)
 
 
-    def dump_tabular(self):
+    def dump_tabular(self, flush=True):
         """
         Write all of the diagnostics from the current iteration.
 
@@ -324,8 +324,9 @@ class Logger:
                     self.output_file.write("\t".join(self.log_headers)+"\n")
                 self.output_file.write("\t".join(map(str,vals))+"\n")
                 self.output_file.flush()
-        self.log_current_row.clear()
-        self.first_row=False
+        if flush:
+            self.log_current_row.clear()
+            self.first_row=False
 
 class EpochLogger(Logger):
     """

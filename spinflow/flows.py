@@ -240,6 +240,62 @@ class AffineConstantFlow(nn.Module):
         return x, log_det
 
 
+class SqrtNonLinearFlow(nn.Module):
+    """
+    Scales + Shifts the flow by (learned) constants per dimension.
+    In NICE paper there is a Scaling layer which is a special case of this where t is None
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, c=None):
+        xh = torch.clamp_min(x, min=0)
+        xl = torch.clamp_max(x, max=0)
+        z = torch.sqrt(xh) - torch.sqrt(-xl)
+        log_det = torch.sum(0.5 * torch.sqrt(1 / xh) + 0.5 * torch.sqrt(- 1 / xl), dim=1)
+        return z, log_det
+
+    def backward(self, z, c=None):
+        zh = torch.clamp_min(z, min=0)
+        zl = torch.clamp_max(z, max=0)
+        x = torch.square(zh) - torch.square(zl)
+        log_det = torch.sum(2 * zh - 2 * zl, dim=1)
+        return x, log_det
+
+
+class AffineConditionalFlow(nn.Module):
+    """
+    Scales + Shifts the flow by (learned) constants per dimension.
+    In NICE paper there is a Scaling layer which is a special case of this where t is None
+    """
+
+    def __init__(self, dim, context_dim, nh=128, scale=True, shift=True):
+        super().__init__()
+
+        self.s = None
+        self.t = None
+
+        if scale:
+            self.s_cond = MLP(context_dim, dim, nh)
+        if shift:
+            self.t_cond = MLP(context_dim, dim, nh)
+
+    def forward(self, x, c=None):
+        s = self.s(c) if self.s is not None else x.new_zeros(x.size())
+        t = self.t(c) if self.t is not None else x.new_zeros(x.size())
+        z = x * torch.exp(s) + t
+        log_det = torch.sum(s, dim=1)
+        return z, log_det
+
+    def backward(self, z, c=None):
+        s = self.s(c) if self.s is not None else z.new_zeros(z.size())
+        t = self.t(c) if self.t is not None else z.new_zeros(z.size())
+        x = (z - t) * torch.exp(-s)
+        log_det = torch.sum(-s, dim=1)
+        return x, log_det
+
+
 class ActNorm(AffineConstantFlow):
     """
     Really an AffineConstantFlow but with a data-dependent initialization,

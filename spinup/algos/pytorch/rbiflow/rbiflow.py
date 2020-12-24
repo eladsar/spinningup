@@ -5,7 +5,7 @@ import torch
 from torch.optim import Adam
 from spinup.utils.run_utils import set_mujoco; set_mujoco(); import gym
 import time
-import core
+import spinup.algos.pytorch.rbi.core as core
 from spinup.utils.logx import EpochLogger
 import math
 import torch.nn.functional as F
@@ -55,14 +55,14 @@ def repeat_and_reshape(x, n):
     return x_expand
 
 
-def rbiflow(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
+def rbi(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
         polyak=0.995, lr=1e-3, alpha=0.2, batch_size=256, start_steps=1000,
         update_after=1000, update_every=50, num_test_episodes=10, max_ep_len=1000, 
         logger_kwargs=dict(), save_freq=1, eps=0.2, n_explore=32, device='cuda',
         n_samples=100, cmin=0.25, cmax=1.75, greed=0.01, rand=0.01):
     """
-    Rerouted Behavior Improvement (rbiflow)
+    Rerouted Behavior Improvement (RBI)
     """
     device = torch.device(device)
     logger = EpochLogger(**logger_kwargs)
@@ -330,7 +330,7 @@ if __name__ == '__main__':
 
     torch.set_num_threads(torch.get_num_threads())
 
-    rbiflow(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
+    rbi(lambda: gym.make(args.env), actor_critic=core.MLPActorCritic,
         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
         logger_kwargs=logger_kwargs, eps=args.eps, n_explore=args.n_explore,

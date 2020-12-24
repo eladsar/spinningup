@@ -105,6 +105,7 @@ def load_pytorch_policy(fpath, itr, deterministic=False, device=None):
 
     model = torch.load(fname)
 
+    print(f'this is device {device}')
     if device is None:
         device = next(model.parameters()).device
     else:
